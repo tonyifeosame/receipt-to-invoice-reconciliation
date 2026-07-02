@@ -1,0 +1,42 @@
+# Go
+bin/
+*.exe
+*.test
+coverage.out
+
+# C++
+build/
+cmake-build-*/
+*.o
+*.obj
+*.a
+*.so
+*.dll
+
+# Visual Studio Code
+.vscode/
+
+# Environment
+.env
+.env.*
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+
+# Docker
+docker-data/
+
+# OCR output
+receipts/
+uploads/
+temp/
+tmp/
+
+# OS
+.DS_Store
+Thumbs.db
