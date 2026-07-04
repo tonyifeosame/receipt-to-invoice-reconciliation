@@ -1,3 +1,18 @@
+#if defined(__has_include)
+#  if __has_include(<tesseract/baseapi.h>)
+#    include <tesseract/baseapi.h>
+#  else
+#    pragma message("tesseract/baseapi.h not found in include path - providing minimal stubs for editor/intellisense")
+#    namespace tesseract {
+#      class TessBaseAPI;
+#      enum PageSegMode { PSM_AUTO = 0 };
+#      enum OcrEngineMode { OEM_DEFAULT = 0 };
+#    }
+#  endif
+#else
+#  include <tesseract/baseapi.h>
+#endif
+
 #include "ocr_engine.h"
 #include "logger.h"
 #include <opencv2/opencv.hpp>
@@ -23,8 +38,11 @@ bool OCREngine::initialize() {
     
     const char* dataPath = dataPath_.empty() ? nullptr : dataPath_.c_str();
     
-    if (tess_->Init(dataPath, language_.c_str())) {
-        LOG_ERROR("Failed to initialize Tesseract OCR");
+  if (tess_->Init(
+        dataPath,
+        language_.c_str(),
+        tesseract::OEM_LSTM_ONLY)) {
+        LOG_ERROR("Failed to initialize Tesseract OCR with data path: " + dataPath_ + " and language: " + language_);
         return false;
     }
     
@@ -136,7 +154,7 @@ void OCREngine::setPageSegMode(int mode) {
         return;
     }
     
-    tess_->SetPageSegMode(static_cast<tesseract::PageSegMode>(mode));
+    tess_->SetPageSegMode(tesseract::PSM_SINGLE_BLOCK);
     LOG_DEBUG("Page segmentation mode set to: " + std::to_string(mode));
 }
 
@@ -145,11 +163,12 @@ void OCREngine::setOemEngine(int mode) {
         LOG_ERROR("OCREngine not initialized");
         return;
     }
-    
-    tess_->SetOcrEngineMode(static_cast<tesseract::OcrEngineMode>(mode));
-    LOG_DEBUG("OCR engine mode set to: " + std::to_string(mode));
-}
 
+    LOG_WARNING(
+        "OCR Engine Mode cannot be changed after initialization. "
+        "Requested mode: " + std::to_string(mode)
+    );
+}
 void OCREngine::setVariable(const std::string& key, const std::string& value) {
     if (!initialized_) {
         LOG_ERROR("OCREngine not initialized");
@@ -162,4 +181,24 @@ void OCREngine::setVariable(const std::string& key, const std::string& value) {
     } else {
         LOG_WARNING("Failed to set variable: " + key);
     }
+}
+
+bool OCREngine::isQualityAcceptable(double confidence, double threshold) {
+    bool acceptable = confidence >= threshold;
+    LOG_DEBUG("OCR confidence " + std::to_string(confidence) + 
+               " vs threshold " + std::to_string(threshold) + 
+               " - " + (acceptable ? "ACCEPTABLE" : "TOO LOW"));
+    return acceptable;
+}
+
+std::string OCREngine::getQualityMessage(double confidence, double threshold) {
+    if (confidence >= threshold) {
+        LOG_INFO("OCR quality acceptable: " + std::to_string(confidence));
+        return "";
+    }
+    
+    std::string message = "Receipt quality is too low (confidence: " + 
+                         std::to_string(confidence) + "/100). Please retake the photo with better lighting and focus.";
+    LOG_WARNING(message);
+    return message;
 }

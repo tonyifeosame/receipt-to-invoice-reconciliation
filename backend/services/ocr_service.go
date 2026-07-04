@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"receipt-reconciliation/models"
 	"runtime"
+	"strconv"
+	"time"
 )
 
 type OCRService interface {
@@ -87,12 +89,22 @@ func (f *FallbackOCREngine) ProcessFile(filePath string) (models.OCRResponse, er
 	}
 
 	return models.OCRResponse{
-		InvoiceNumber: "INV-DEV-001",
-		AmountPaid:    1500.00,
-		PaymentDate:   "2026-07-02",
-		BankReference: "DEV-REF",
-		CustomerName:  "Development Customer",
-		IsValid:       true,
+		ReceiptID: "REC-DEV-001",
+		RequestID: GenerateRequestID(),
+		OCR: models.OCRMetadata{
+			Confidence:       95.0,
+			Engine:           "Tesseract",
+			ProcessingTimeMs: 100,
+		},
+		Fields: models.ExtractedFields{
+			InvoiceNumber: "INV-DEV-001",
+			Amount:        1500.00,
+			Date:          "2026-07-02",
+			Customer:      "Development Customer",
+			Reference:     "DEV-REF",
+		},
+		RawText:   "Sample OCR text for development",
+		ImageName: filepath.Base(filePath),
 	}, nil
 }
 
@@ -105,4 +117,8 @@ func NewOCRService() OCRService {
 		return nativeEngine
 	}
 	return NewFallbackOCREngine()
+}
+
+func GenerateRequestID() string {
+	return "REQ-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 }

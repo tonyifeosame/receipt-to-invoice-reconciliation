@@ -137,13 +137,22 @@ func (s *stubOCRService) ProcessFile(filePath string) (models.OCRResponse, error
 
 func TestReceiptHandler_ProcessOCR(t *testing.T) {
 	handler := &ReceiptHandler{ocr: &stubOCRService{response: models.OCRResponse{
-		InvoiceNumber: "INV-001",
-		AmountPaid:    1500.00,
-		PaymentDate:   "2026-06-29",
-		BankReference: "REF12345",
-		CustomerName:  "Acme Corporation",
-		IsValid:       true,
-		Confidence:    95,
+		ReceiptID: "REC-001",
+		RequestID: "REQ-123",
+		OCR: models.OCRMetadata{
+			Confidence:       95,
+			Engine:           "Tesseract",
+			ProcessingTimeMs: 100,
+		},
+		Fields: models.ExtractedFields{
+			InvoiceNumber: "INV-001",
+			Amount:        1500.00,
+			Date:          "2026-06-29",
+			Customer:      "Acme Corporation",
+			Reference:     "REF12345",
+		},
+		RawText:   "Sample OCR text",
+		ImageName: "receipt.jpg",
 	}}}
 
 	reqBody := map[string]string{
@@ -166,20 +175,29 @@ func TestReceiptHandler_ProcessOCR(t *testing.T) {
 		t.Fatalf("Expected valid JSON response: %v", err)
 	}
 
-	if response.InvoiceNumber != "INV-001" {
-		t.Fatalf("Expected invoice number INV-001, got %s", response.InvoiceNumber)
+	if response.Fields.InvoiceNumber != "INV-001" {
+		t.Fatalf("Expected invoice number INV-001, got %s", response.Fields.InvoiceNumber)
 	}
 }
 
 func TestReceiptHandler_ProcessOCR_LowConfidenceReview(t *testing.T) {
 	handler := &ReceiptHandler{ocr: &stubOCRService{response: models.OCRResponse{
-		InvoiceNumber: "INV-001",
-		AmountPaid:    1500.00,
-		PaymentDate:   "2026-06-29",
-		BankReference: "REF12345",
-		CustomerName:  "Acme Corporation",
-		IsValid:       true,
-		Confidence:    70,
+		ReceiptID: "REC-001",
+		RequestID: "REQ-123",
+		OCR: models.OCRMetadata{
+			Confidence:       70,
+			Engine:           "Tesseract",
+			ProcessingTimeMs: 100,
+		},
+		Fields: models.ExtractedFields{
+			InvoiceNumber: "INV-001",
+			Amount:        1500.00,
+			Date:          "2026-06-29",
+			Customer:      "Acme Corporation",
+			Reference:     "REF12345",
+		},
+		RawText:   "Sample OCR text",
+		ImageName: "receipt.jpg",
 	}}}
 
 	reqBody := map[string]string{
@@ -202,12 +220,9 @@ func TestReceiptHandler_ProcessOCR_LowConfidenceReview(t *testing.T) {
 		t.Fatalf("Expected valid JSON response: %v", err)
 	}
 
-	if response.InvoiceNumber != "" {
-		t.Fatalf("Expected low-confidence OCR to be cleared for review, got %s", response.InvoiceNumber)
-	}
-
-	if response.IsValid {
-		t.Fatalf("Expected low-confidence OCR to be marked invalid for review")
+	// With validation removed, all OCR results are preserved
+	if response.Fields.InvoiceNumber != "INV-001" {
+		t.Fatalf("Expected invoice number to be preserved, got %s", response.Fields.InvoiceNumber)
 	}
 }
 

@@ -1,5 +1,6 @@
 #include "file_utils.h"
 #include "logger.h"
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <iomanip>

@@ -35,14 +35,21 @@ public:
     std::string extractDate(const std::string& text);
     std::string extractBankReference(const std::string& text);
     std::string extractCustomerName(const std::string& text);
+    std::string extractPhoneNumber(const std::string& text);
+    std::string extractEmail(const std::string& text);
 
 private:
     // Regex patterns
-    std::regex invoiceNumberPattern_;
+    std::vector<std::regex> invoiceNumberPatterns_;
     std::regex amountPattern_;
-    std::regex datePattern_;
+    std::vector<std::regex> datePatterns_;
     std::regex bankRefPattern_;
     std::regex customerNamePattern_;
+    std::regex phonePattern_;
+    std::regex emailPattern_;
+    
+    // Pattern matching helpers
+    std::string tryMultiplePatterns(const std::string& text, const std::vector<std::regex>& patterns);
     
     // Helper methods
     double parseAmount(const std::string& amountStr);

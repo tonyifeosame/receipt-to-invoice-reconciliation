@@ -3,6 +3,7 @@
 
 #include <tesseract/baseapi.h>
 #include <leptonica/allheaders.h>
+#include <opencv2/opencv.hpp>
 #include <string>
 #include <memory>
 
@@ -30,6 +31,10 @@ public:
     void setPageSegMode(int mode);
     void setOemEngine(int mode);
     void setVariable(const std::string& key, const std::string& value);
+    
+    // Quality assessment
+    bool isQualityAcceptable(double confidence, double threshold = 70.0);
+    std::string getQualityMessage(double confidence, double threshold = 70.0);
 
 private:
     std::unique_ptr<tesseract::TessBaseAPI> tess_;

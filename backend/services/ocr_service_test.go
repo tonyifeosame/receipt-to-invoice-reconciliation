@@ -19,11 +19,7 @@ func TestFallbackOCREngineReturnsStructuredResponse(t *testing.T) {
 		t.Fatalf("expected fallback OCR response, got error: %v", err)
 	}
 
-	if !response.IsValid {
-		t.Fatalf("expected fallback response to be valid, got %+v", response)
-	}
-
-	if response.InvoiceNumber == "" {
+	if response.Fields.InvoiceNumber == "" {
 		t.Fatalf("expected fallback response to contain an invoice number, got %+v", response)
 	}
 }

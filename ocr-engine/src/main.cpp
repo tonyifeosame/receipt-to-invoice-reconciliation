@@ -16,18 +16,45 @@ using json = nlohmann::json;
 json buildResponse(const std::string& imagePath, bool success, const std::string& message,
                    const std::string& invoiceNumber = "", double amountPaid = 0.0,
                    const std::string& paymentDate = "", const std::string& bankReference = "",
-                   const std::string& customerName = "", bool isValid = false, double confidence = 0.0) {
+                   const std::string& customerName = "", const std::string& phoneNumber = "",
+                   const std::string& email = "", const std::string& rawText = "",
+                   double confidence = 0.0, int processingTimeMs = 0) {
     json response;
-    response["file_path"] = imagePath;
-    response["success"] = success;
-    response["message"] = message;
-    response["invoice_number"] = invoiceNumber;
-    response["amount_paid"] = amountPaid;
-    response["payment_date"] = paymentDate;
-    response["bank_reference"] = bankReference;
-    response["customer_name"] = customerName;
-    response["is_valid"] = isValid;
-    response["confidence"] = confidence;
+    
+    // Generate unique request ID
+    std::string requestId = "REQ-" + std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count());
+    
+    // Generate receipt ID from file path
+    std::string receiptId = imagePath;
+    size_t lastSlash = receiptId.find_last_of("/\\");
+    if (lastSlash != std::string::npos) {
+        receiptId = receiptId.substr(lastSlash + 1);
+    }
+    
+    response["receipt_id"] = receiptId;
+    response["request_id"] = requestId;
+    
+    // OCR metadata section
+    response["ocr"]["confidence"] = confidence;
+    response["ocr"]["engine"] = "Tesseract";
+    response["ocr"]["processing_time_ms"] = processingTimeMs;
+    
+    // Extracted fields section
+    response["fields"]["invoice_number"] = invoiceNumber;
+    response["fields"]["amount"] = amountPaid;
+    response["fields"]["date"] = paymentDate;
+    response["fields"]["customer"] = customerName;
+    response["fields"]["reference"] = bankReference;
+    response["fields"]["phone_number"] = phoneNumber;
+    response["fields"]["email"] = email;
+    
+    // Raw OCR text
+    response["raw_text"] = rawText;
+    
+    // Image name
+    response["image_name"] = receiptId;
+    
     return response;
 }
 
@@ -110,182 +137,54 @@ Config loadConfig(const std::string& configPath) {
     return config;
 }
 
-bool processReceipt(const std::string& imagePath, Database& db, OCREngine& ocr, 
+bool processReceipt(const std::string& imagePath, OCREngine& ocr, 
                     ImageProcessor& imgProcessor, ReceiptParser& parser, json& result) {
     auto startTime = std::chrono::high_resolution_clock::now();
     LOG_INFO("Processing receipt: " + imagePath);
     result = buildResponse(imagePath, false, "Processing started");
     
-    // Step 1: Calculate file hash for duplicate detection
-    std::string fileHash = FileUtils::calculateSHA256(imagePath);
-    if (fileHash.empty()) {
-        LOG_ERROR("Failed to calculate file hash");
-        result = buildResponse(imagePath, false, "Failed to calculate file hash");
-        return false;
-    }
-    
-    // Step 2: Check for duplicate file
-    if (db.isDuplicateFileHash(fileHash)) {
-        LOG_ERROR("Duplicate file detected - file already processed");
-        db.recordMetric("duplicate_receipts_detected", 1.0, "counter");
-        result = buildResponse(imagePath, false, "Duplicate file detected");
-        return false;
-    }
-    
-    // Step 3: Get file metadata
-    int64_t fileSize = FileUtils::getFileSize(imagePath);
-    std::string mimeType = FileUtils::getMimeType(imagePath);
-    
-    // Step 4: Preprocess image
+    // Step 1: Preprocess image
     cv::Mat processedImage = imgProcessor.preprocessImage(imagePath);
     if (processedImage.empty()) {
         LOG_ERROR("Image preprocessing failed");
-        db.recordMetric("preprocessing_failures", 1.0, "counter");
-        result = buildResponse(imagePath, false, "Image preprocessing failed");
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+        result = buildResponse(imagePath, false, "Image preprocessing failed", "", 0.0, "", "", "", "", "", "", 0.0, static_cast<int>(totalDuration));
         return false;
     }
     
-    // Step 5: Extract text using OCR with confidence
+    // Step 2: Extract text using OCR with confidence
     OCREngine::OCRResult ocrResult = ocr.extractTextWithConfidenceFromMat(processedImage);
     if (ocrResult.text.empty()) {
         LOG_ERROR("OCR extraction failed");
-        db.recordMetric("ocr_failures", 1.0, "counter");
-        result = buildResponse(imagePath, false, "OCR extraction failed", "", 0.0, "", "", "", false, ocrResult.confidence);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+        result = buildResponse(imagePath, false, "OCR extraction failed", "", 0.0, "", "", "", "", "", "", ocrResult.confidence, static_cast<int>(totalDuration));
         return false;
     }
     
     LOG_DEBUG("OCR Text extracted: " + ocrResult.text.substr(0, 200) + "...");
     LOG_INFO("OCR Confidence: " + std::to_string(ocrResult.confidence));
     
-    // Step 6: Store OCR result for debugging
-    auto ocrEndTime = std::chrono::high_resolution_clock::now();
-    auto ocrDuration = std::chrono::duration_cast<std::chrono::milliseconds>(ocrEndTime - startTime).count();
-    db.createOCRResult(imagePath, fileHash, ocrResult.text, ocrResult.confidence, static_cast<int>(ocrDuration));
-    
-    // Step 7: Parse receipt data with confidence
+    // Step 3: Parse receipt data
     ReceiptData receiptData = parser.parseReceipt(ocrResult.text, ocrResult.confidence);
-    if (!receiptData.isValid) {
-        LOG_ERROR("Receipt parsing failed - invalid data");
-        db.recordMetric("parsing_failures", 1.0, "counter");
-        
-        // Add to review queue for manual inspection
-        db.addToReviewQueue(imagePath, fileHash, "", 0.0, "", ocrResult.confidence, "Parsing failed");
-        result = buildResponse(imagePath, false, "Parsing failed", receiptData.invoiceNumber,
-                               receiptData.amountPaid, receiptData.paymentDate,
-                               receiptData.bankReference, receiptData.customerName,
-                               false, receiptData.confidence);
-        return false;
-    }
     
-    LOG_INFO("Parsed receipt - Invoice: " + receiptData.invoiceNumber + 
-             ", Amount: " + std::to_string(receiptData.amountPaid) +
-             ", Confidence: " + std::to_string(receiptData.confidence) +
-             ", Manual Review: " + (receiptData.requiresManualReview ? "Yes" : "No"));
+    // Step 4: Extract phone and email from OCR text
+    std::string extractedPhone = parser.extractPhoneNumber(ocrResult.text);
+    std::string extractedEmail = parser.extractEmail(ocrResult.text);
     
-    // Step 8: Handle low confidence - send to review queue
-    if (receiptData.requiresManualReview) {
-        LOG_WARNING("Low confidence - sending to review queue");
-        db.addToReviewQueue(imagePath, fileHash, receiptData.invoiceNumber, 
-                           receiptData.amountPaid, receiptData.paymentDate, 
-                           receiptData.confidence, "Low OCR confidence");
-        db.recordMetric("manual_review_required", 1.0, "counter");
-        db.createReconciliationRecord(receiptData.invoiceNumber, imagePath, "PENDING_REVIEW", receiptData.confidence);
-        result = buildResponse(imagePath, true, "Needs manual review", receiptData.invoiceNumber,
-                               receiptData.amountPaid, receiptData.paymentDate,
-                               receiptData.bankReference, receiptData.customerName,
-                               false, receiptData.confidence);
-        return true; // Return true as it was handled (just needs review)
-    }
-    
-    // Step 9: Lookup invoice in database
-    Invoice invoice = db.getInvoiceByNumber(receiptData.invoiceNumber);
-    if (invoice.id == 0) {
-        LOG_ERROR("Invoice not found: " + receiptData.invoiceNumber);
-        db.addToReviewQueue(imagePath, fileHash, receiptData.invoiceNumber, 
-                           receiptData.amountPaid, receiptData.paymentDate, 
-                           receiptData.confidence, "Invoice not found");
-        db.createReconciliationRecord(receiptData.invoiceNumber, imagePath, "UNMATCHED", receiptData.confidence);
-        db.recordMetric("invoice_not_found", 1.0, "counter");
-        result = buildResponse(imagePath, false, "Invoice not found", receiptData.invoiceNumber,
-                               receiptData.amountPaid, receiptData.paymentDate,
-                               receiptData.bankReference, receiptData.customerName,
-                               false, receiptData.confidence);
-        return false;
-    }
-    
-    LOG_INFO("Invoice found - ID: " + std::to_string(invoice.id) + 
-             ", Customer: " + invoice.customerName);
-    
-    // Step 10: Validate payment amount
-    if (receiptData.amountPaid > invoice.amount) {
-        LOG_WARNING("Payment amount exceeds invoice amount");
-        db.addToReviewQueue(imagePath, fileHash, receiptData.invoiceNumber, 
-                           receiptData.amountPaid, receiptData.paymentDate, 
-                           receiptData.confidence, "Payment exceeds invoice amount");
-    }
-    
-    // Step 11: Check for duplicate payment
-    if (db.isDuplicatePayment(receiptData.invoiceNumber, receiptData.bankReference)) {
-        LOG_ERROR("Duplicate payment detected");
-        db.recordMetric("duplicate_payments_detected", 1.0, "counter");
-        return false;
-    }
-    
-    // Step 12: Create payment record with file metadata
-    Payment payment;
-    payment.invoiceId = invoice.id;
-    payment.receiptFile = imagePath;
-    payment.paymentAmount = receiptData.amountPaid;
-    payment.paymentDate = receiptData.paymentDate;
-    payment.reference = receiptData.bankReference;
-    payment.fileHash = fileHash;
-    payment.fileSize = fileSize;
-    payment.mimeType = mimeType;
-    
-    if (!db.createPayment(payment)) {
-        LOG_ERROR("Failed to create payment record");
-        db.recordMetric("payment_creation_failures", 1.0, "counter");
-        return false;
-    }
-    
-    // Step 13: Update invoice status
-    if (!db.updateInvoiceStatus(receiptData.invoiceNumber, "PAID")) {
-        LOG_ERROR("Failed to update invoice status");
-        return false;
-    }
-    
-    // Step 14: Update invoice balance
-    if (!db.updateInvoiceBalance(receiptData.invoiceNumber, receiptData.amountPaid)) {
-        LOG_ERROR("Failed to update invoice balance");
-        return false;
-    }
-    
-    // Step 15: Create reconciliation record with confidence
-    if (!db.createReconciliationRecord(receiptData.invoiceNumber, imagePath, "MATCHED", receiptData.confidence)) {
-        LOG_ERROR("Failed to create reconciliation record");
-        return false;
-    }
-    
-    // Step 16: Create audit log
-    db.createAuditLog("RECONCILIATION", 
-                     "Receipt " + imagePath + " matched to invoice " + receiptData.invoiceNumber + 
-                     " with confidence " + std::to_string(receiptData.confidence),
-                     "system");
-    
-    // Step 17: Record metrics
+    // Step 5: Return all OCR results without validation
     auto endTime = std::chrono::high_resolution_clock::now();
     auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
     
-    db.recordMetric("receipts_processed", 1.0, "counter");
-    db.recordMetric("successful_reconciliations", 1.0, "counter");
-    db.recordMetric("processing_time_ms", static_cast<double>(totalDuration), "gauge");
-    db.recordMetric("ocr_confidence", receiptData.confidence, "gauge");
+    result = buildResponse(imagePath, true, "OCR processing completed", 
+                           receiptData.invoiceNumber, receiptData.amountPaid, 
+                           receiptData.paymentDate, receiptData.bankReference, 
+                           receiptData.customerName, extractedPhone, extractedEmail, 
+                           ocrResult.text, receiptData.confidence, 
+                           static_cast<int>(totalDuration));
     
-    result = buildResponse(imagePath, true, "Receipt processed successfully", receiptData.invoiceNumber,
-                           receiptData.amountPaid, receiptData.paymentDate,
-                           receiptData.bankReference, receiptData.customerName,
-                           true, receiptData.confidence);
-    LOG_INFO("Receipt processed and reconciled successfully in " + std::to_string(totalDuration) + "ms");
+    LOG_INFO("OCR processing completed in " + std::to_string(totalDuration) + "ms");
     return true;
 }
 
@@ -307,13 +206,9 @@ int main(int argc, char* argv[]) {
     
     LOG_INFO("Starting OCR Engine");
     
-    // Initialize database connection
-    Database db(config.dbHost, config.dbPort, config.dbName, 
-                config.dbUser, config.dbPassword);
-    if (!db.connect()) {
-        LOG_CRITICAL("Failed to connect to database");
-        return 1;
-    }
+    // Database operations are now handled by the company API
+    // OCR engine only performs image processing and text extraction
+    LOG_INFO("Database operations delegated to company API");
     
     // Initialize OCR engine
     OCREngine ocr(config.tesseractDataPath, config.tesseractLanguage);
@@ -337,7 +232,7 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Processing single receipt: " + imagePath);
         
         json result;
-        if (processReceipt(imagePath, db, ocr, imgProcessor, parser, result)) {
+        if (processReceipt(imagePath, ocr, imgProcessor, parser, result)) {
             std::cout << result.dump(2) << std::endl;
         } else {
             std::cout << result.dump(2) << std::endl;
@@ -359,7 +254,8 @@ int main(int argc, char* argv[]) {
                         ext == ".JPEG" || ext == ".PNG") {
                         std::string imagePath = entry.path().string();
                         
-                        if (processReceipt(imagePath, db, ocr, imgProcessor, parser)) {
+                        json result;
+                        if (processReceipt(imagePath, ocr, imgProcessor, parser, result)) {
                             processed++;
                         } else {
                             failed++;
@@ -376,7 +272,6 @@ int main(int argc, char* argv[]) {
     }
     
     LOG_INFO("OCR Engine shutting down");
-    db.disconnect();
     
     return 0;
 }

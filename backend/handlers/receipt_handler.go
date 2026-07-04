@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"receipt-reconciliation/jobs"
 	"receipt-reconciliation/models"
 	"receipt-reconciliation/services"
+	"strconv"
 	"strings"
 )
 
@@ -28,13 +30,24 @@ type OCRService interface {
 	ProcessFile(string) (models.OCRResponse, error)
 }
 
-type ReceiptHandler struct {
-	db  InvoiceRepository
-	ocr OCRService
+type CompanyAPIService interface {
+	SendOCRResults(models.OCRResponse) (*services.CompanyAPIResponse, error)
 }
 
-func NewReceiptHandler(db InvoiceRepository) *ReceiptHandler {
-	return &ReceiptHandler{db: db, ocr: services.NewOCRService()}
+type ReceiptHandler struct {
+	db       InvoiceRepository
+	ocr      OCRService
+	company  CompanyAPIService
+	jobQueue *jobs.JobQueue
+}
+
+func NewReceiptHandler(db InvoiceRepository, jobQueue *jobs.JobQueue) *ReceiptHandler {
+	return &ReceiptHandler{
+		db:       db,
+		ocr:      services.NewOCRService(),
+		company:  services.NewCompanyAPIClient(),
+		jobQueue: jobQueue,
+	}
 }
 
 func (h *ReceiptHandler) UploadReceipt(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +145,25 @@ func (h *ReceiptHandler) ProcessOCR(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("OCR processing requested for: %s", req.ReceiptFile)
 
+	// Create job for asynchronous processing
+	if h.jobQueue != nil {
+		payload := map[string]interface{}{
+			"receipt_file": req.ReceiptFile,
+			"request_id":   services.GenerateRequestID(),
+		}
+		jobID, err := h.jobQueue.Enqueue(jobs.JobOCRProcess, payload, 1)
+		if err != nil {
+			log.Printf("Failed to enqueue OCR job: %v", err)
+			http.Error(w, "Failed to create job", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("OCR job created: %d for receipt: %s", jobID, req.ReceiptFile)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"job_id": jobID, "status": "queued"})
+		return
+	}
+
+	// Fallback to synchronous processing if job queue not available
 	if h.ocr == nil {
 		h.ocr = services.NewOCRService()
 	}
@@ -143,12 +175,29 @@ func (h *ReceiptHandler) ProcessOCR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !response.IsValid || response.Confidence < 85 {
-		response.IsValid = false
-		response.InvoiceNumber = ""
-		response.AmountPaid = 0
-		response.BankReference = ""
-		response.CustomerName = ""
+	// Set receipt ID and image name from file path
+	response.ReceiptID = filepath.Base(req.ReceiptFile)
+	response.ImageName = filepath.Base(req.ReceiptFile)
+
+	// Send OCR results to company API
+	if h.company != nil {
+		companyResponse, err := h.company.SendOCRResults(response)
+		if err != nil {
+			log.Printf("Failed to send OCR results to company API: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"ocr_results":      response,
+				"company_response": map[string]any{"success": false, "message": err.Error(), "status": "api_error"},
+			})
+			return
+		}
+		log.Printf("Company API response: success=%v, message=%s", companyResponse.Success, companyResponse.Message)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"ocr_results":      response,
+			"company_response": companyResponse,
+		})
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -161,46 +210,46 @@ func (h *ReceiptHandler) ReviewDecision(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var req models.ReviewDecisionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	if req.Decision != "reject" && req.Decision != "approve" {
-		http.Error(w, "Decision must be approve or reject", http.StatusBadRequest)
-		return
-	}
-
-	if h.db == nil {
-		http.Error(w, "Database not initialized", http.StatusInternalServerError)
-		return
-	}
-
-	status := "UNMATCHED"
-	if req.Decision == "approve" {
-		status = "MATCHED"
-	}
-
-	if err := h.db.CreateReconciliationRecord(req.InvoiceNumber, req.ReceiptFile, status); err != nil {
-		log.Printf("Error creating review decision record: %v", err)
-	}
-
-	action := "REVIEW_REJECTED"
-	if req.Decision == "approve" {
-		action = "REVIEW_APPROVED"
-	}
-
-	description := fmt.Sprintf("Review %s for %s", req.Decision, req.ReceiptFile)
-	if req.Reason != "" {
-		description = fmt.Sprintf("%s - %s", description, req.Reason)
-	}
-	if err := h.db.CreateAuditLog(action, description, "system"); err != nil {
-		log.Printf("Error creating audit log: %v", err)
-	}
-
+	// Review decisions are now handled by the company API
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "Review decision recorded"})
+	json.NewEncoder(w).Encode(map[string]any{
+		"success": false,
+		"message": "Review decisions are now handled by the company API. Please use the company's system for approval/rejection decisions.",
+	})
+}
+
+func (h *ReceiptHandler) GetJobStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	jobIDStr := r.URL.Query().Get("job_id")
+	if jobIDStr == "" {
+		http.Error(w, "job_id parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	jobID, err := strconv.Atoi(jobIDStr)
+	if err != nil {
+		http.Error(w, "Invalid job_id", http.StatusBadRequest)
+		return
+	}
+
+	// Query job status from database
+	if h.db != nil {
+		// This would need to be implemented in the repository
+		// For now, return a placeholder response
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"job_id":  jobID,
+			"status":  "unknown",
+			"message": "Job status query not yet implemented",
+		})
+		return
+	}
+
+	http.Error(w, "Database not available", http.StatusInternalServerError)
 }
 
 func (h *ReceiptHandler) Reconcile(w http.ResponseWriter, r *http.Request) {
@@ -209,91 +258,10 @@ func (h *ReceiptHandler) Reconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req models.ReconcileRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("Reconciliation requested for invoice: %s", req.InvoiceNumber)
-
-	if h.db == nil {
-		http.Error(w, "Database not initialized", http.StatusInternalServerError)
-		return
-	}
-
-	// Get invoice from database
-	invoice, err := h.db.GetInvoiceByNumber(req.InvoiceNumber)
-	if err != nil {
-		response := models.ReconcileResponse{
-			Success: false,
-			Message: "Invoice not found",
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-		return
-	}
-
-	// Check for duplicate payment
-	isDuplicate, err := h.db.IsDuplicatePayment(req.InvoiceNumber, req.Reference)
-	if err != nil {
-		log.Printf("Error checking duplicate payment: %v", err)
-	} else if isDuplicate {
-		response := models.ReconcileResponse{
-			Success: false,
-			Message: "Duplicate payment detected",
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-		return
-	}
-
-	// Create payment record
-	payment := models.Payment{
-		InvoiceID:     invoice.ID,
-		ReceiptFile:   req.ReceiptFile,
-		PaymentAmount: req.AmountPaid,
-		PaymentDate:   req.PaymentDate,
-		Reference:     req.Reference,
-	}
-
-	if err := h.db.CreatePayment(payment); err != nil {
-		log.Printf("Error creating payment: %v", err)
-		response := models.ReconcileResponse{
-			Success: false,
-			Message: "Failed to create payment record",
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-		return
-	}
-
-	// Update invoice status
-	if err := h.db.UpdateInvoiceStatus(req.InvoiceNumber, "PAID"); err != nil {
-		log.Printf("Error updating invoice status: %v", err)
-	}
-
-	// Update invoice balance
-	if err := h.db.UpdateInvoiceBalance(req.InvoiceNumber, req.AmountPaid); err != nil {
-		log.Printf("Error updating invoice balance: %v", err)
-	}
-
-	// Create reconciliation record
-	if err := h.db.CreateReconciliationRecord(req.InvoiceNumber, req.ReceiptFile, "MATCHED"); err != nil {
-		log.Printf("Error creating reconciliation record: %v", err)
-	}
-
-	// Create audit log
-	if err := h.db.CreateAuditLog("RECONCILIATION",
-		"Receipt "+req.ReceiptFile+" matched to invoice "+req.InvoiceNumber, "system"); err != nil {
-		log.Printf("Error creating audit log: %v", err)
-	}
-
-	response := models.ReconcileResponse{
-		Success: true,
-		Message: "Reconciliation completed successfully",
-	}
-
+	// Reconciliation is now handled by the company API
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(map[string]any{
+		"success": false,
+		"message": "Reconciliation is now handled by the company API. OCR results are automatically sent to the company system for processing.",
+	})
 }

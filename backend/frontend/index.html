@@ -5,6 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Receipt Finance Dashboard</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+    <style>
+      .status-pill { font-size: 0.85rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+      .page-view { animation: fadeIn 180ms ease-in-out; }
+      .data-card { min-height: 140px; }
+      .table-sortable th { cursor: pointer; }
+      .table-sortable th:hover { color: #0d6efd; }
+      .ocr-preview-grid { display: grid; grid-template-columns: 1fr 1.5fr; gap: 1rem; }
+      .ocr-preview-card { background: #f8f9fa; border-radius: .5rem; padding: 1rem; }
+      @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
+    </style>
   </head>
   <body class="bg-light">
     <div class="d-flex">
@@ -42,95 +52,225 @@
         </section>
 
         <section id="appSection" class="d-none">
-          <div class="row g-3 mb-4">
-            <div class="col-md-3">
-              <div class="card shadow-sm p-3 border-success-subtle bg-success-subtle">
-                <div class="text-muted">Successful reconciliations</div>
-                <h3 id="successfulReconciliations">0</h3>
+          <div id="page-dashboard" class="page-view">
+            <div class="row g-3 mb-4">
+              <div class="col-md-3">
+                <div class="card shadow-sm p-3 border-success-subtle bg-success-subtle">
+                  <div class="text-muted">Successful reconciliations</div>
+                  <h3 id="successfulReconciliations">0</h3>
+                </div>
+              </div>
+              <div class="col-md-3">
+                <div class="card shadow-sm p-3 border-danger-subtle bg-danger-subtle">
+                  <div class="text-muted">Failed reconciliations</div>
+                  <h3 id="failedReconciliations">0</h3>
+                </div>
+              </div>
+              <div class="col-md-3">
+                <div class="card shadow-sm p-3 border-warning-subtle bg-warning-subtle">
+                  <div class="text-muted">Pending reviews</div>
+                  <h3 id="pendingReviews">0</h3>
+                </div>
+              </div>
+              <div class="col-md-3">
+                <div class="card shadow-sm p-3 border-info-subtle bg-info-subtle">
+                  <div class="text-muted">Recent uploads</div>
+                  <h3 id="recentUploads">0</h3>
+                </div>
               </div>
             </div>
-            <div class="col-md-3">
-              <div class="card shadow-sm p-3 border-danger-subtle bg-danger-subtle">
-                <div class="text-muted">Failed reconciliations</div>
-                <h3 id="failedReconciliations">0</h3>
+
+            <div class="row g-3 mb-4">
+              <div class="col-lg-6">
+                <div class="card shadow-sm p-3 h-100">
+                  <h5>Daily reconciliations</h5>
+                  <canvas id="dailyChart" height="180"></canvas>
+                </div>
               </div>
-            </div>
-            <div class="col-md-3">
-              <div class="card shadow-sm p-3 border-warning-subtle bg-warning-subtle">
-                <div class="text-muted">Pending reviews</div>
-                <h3 id="pendingReviews">0</h3>
-              </div>
-            </div>
-            <div class="col-md-3">
-              <div class="card shadow-sm p-3 border-info-subtle bg-info-subtle">
-                <div class="text-muted">Recent uploads</div>
-                <h3 id="recentUploads">0</h3>
+              <div class="col-lg-6">
+                <div class="card shadow-sm p-3 h-100">
+                  <h5>OCR success rate</h5>
+                  <canvas id="ocrChart" height="180"></canvas>
+                </div>
               </div>
             </div>
           </div>
 
-          <div class="row g-3 mb-4">
-            <div class="col-lg-6">
-              <div class="card shadow-sm p-3 h-100">
-                <h5>Daily reconciliations</h5>
-                <canvas id="dailyChart" height="180"></canvas>
+          <div id="page-upload" class="page-view d-none">
+            <div class="card shadow-sm p-3 mb-3">
+              <h4>Upload receipt</h4>
+              <form id="uploadForm" enctype="multipart/form-data">
+                <div class="mb-3">
+                  <input id="receiptFile" class="form-control" type="file" accept="image/png,image/jpeg,.pdf" required />
+                </div>
+                <button class="btn btn-success">Upload</button>
+              </form>
+              <div class="progress mt-3 d-none" id="uploadProgressWrap">
+                <div id="uploadProgressBar" class="progress-bar" style="width: 0%">0%</div>
               </div>
+              <div id="uploadStatus" class="mt-3"></div>
             </div>
-            <div class="col-lg-6">
-              <div class="card shadow-sm p-3 h-100">
-                <h5>OCR success rate</h5>
-                <canvas id="ocrChart" height="180"></canvas>
+            <div class="ocr-preview-grid mb-3 d-none" id="ocrPreviewPanel">
+              <div class="ocr-preview-card" id="receiptImagePreview">
+                <div class="text-muted mb-2">Receipt image</div>
+                <img id="receiptPreviewImage" class="img-fluid rounded" alt="Receipt preview" />
+              </div>
+              <div class="ocr-preview-card">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                  <div>
+                    <h5>OCR preview</h5>
+                    <div class="text-muted">Detected receipt metadata</div>
+                  </div>
+                  <div id="ocrConfidenceBadge" class="badge bg-secondary status-pill">Confidence</div>
+                </div>
+                <dl class="row mb-3">
+                  <dt class="col-5">Invoice Number</dt><dd class="col-7" id="ocrInvoiceNumber">-</dd>
+                  <dt class="col-5">Amount</dt><dd class="col-7" id="ocrAmount">-</dd>
+                  <dt class="col-5">Date</dt><dd class="col-7" id="ocrDate">-</dd>
+                  <dt class="col-5">Reference</dt><dd class="col-7" id="ocrReference">-</dd>
+                  <dt class="col-5">Customer</dt><dd class="col-7" id="ocrCustomer">-</dd>
+                </dl>
+                <div class="d-flex gap-2">
+                  <button id="approveOCRBtn" class="btn btn-success flex-fill">Approve</button>
+                  <button id="rejectOCRBtn" class="btn btn-outline-danger flex-fill">Reject</button>
+                </div>
               </div>
             </div>
           </div>
 
-          <div class="row g-3">
-            <div class="col-lg-7">
-              <div class="card shadow-sm p-3 mb-3">
-                <h4>Upload receipt</h4>
-                <form id="uploadForm" enctype="multipart/form-data">
-                  <input id="receiptFile" class="form-control mb-2" type="file" required />
-                  <div id="previewBox" class="border rounded p-2 mb-2 d-none"></div>
-                  <button class="btn btn-success">Upload</button>
-                </form>
-                <div class="progress mt-3 d-none" id="uploadProgressWrap">
-                  <div id="uploadProgressBar" class="progress-bar" style="width: 0%">0%</div>
+          <div id="page-reviews" class="page-view d-none">
+            <div class="card shadow-sm p-3 mb-3">
+              <div class="d-flex justify-content-between align-items-center mb-3">
+                <h4 class="mb-0">Review queue</h4>
+                <div class="input-group" style="max-width: 320px;">
+                  <span class="input-group-text">Search</span>
+                  <input id="reviewSearchInput" class="form-control" placeholder="Invoice, receipt, status" />
                 </div>
-                <div id="uploadStatus" class="mt-3"></div>
               </div>
-
-              <div class="card shadow-sm p-3 mb-3">
-                <h4>Review queue</h4>
-                <div class="table-responsive">
-                  <table class="table table-sm align-middle">
-                    <thead>
-                      <tr><th>Receipt</th><th>Invoice</th><th>Confidence</th><th>Status</th><th>Action</th></tr>
-                    </thead>
-                    <tbody id="reviewList"></tbody>
-                  </table>
+              <div class="table-responsive">
+                <table class="table table-sm align-middle table-sortable">
+                  <thead>
+                    <tr>
+                      <th data-sort="receipt_file">Receipt</th>
+                      <th data-sort="invoice_number">Invoice</th>
+                      <th data-sort="confidence">Confidence</th>
+                      <th data-sort="status">Status</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody id="reviewList"></tbody>
+                </table>
+              </div>
+              <div class="d-flex justify-content-between align-items-center mt-3">
+                <small id="reviewPageInfo" class="text-muted">Page 1</small>
+                <div>
+                  <button id="reviewPrev" class="btn btn-outline-secondary btn-sm me-2">Previous</button>
+                  <button id="reviewNext" class="btn btn-outline-secondary btn-sm">Next</button>
                 </div>
               </div>
             </div>
+          </div>
 
-            <div class="col-lg-5">
-              <div class="card shadow-sm p-3 mb-3">
-                <h4>Search invoices & payments</h4>
-                <div class="input-group mb-2">
-                  <input id="invoiceSearch" class="form-control" placeholder="Invoice number" />
-                  <button id="searchInvoiceBtn" class="btn btn-outline-primary">Search</button>
+          <div id="page-invoices" class="page-view d-none">
+            <div class="card shadow-sm p-3 mb-3">
+              <div class="d-flex justify-content-between align-items-center mb-3">
+                <h4 class="mb-0">Invoices</h4>
+                <div class="input-group" style="max-width: 380px;">
+                  <input id="invoiceTableSearch" class="form-control" placeholder="Search invoices" />
+                  <button id="invoiceTableClear" class="btn btn-outline-secondary">Clear</button>
                 </div>
-                <div class="input-group mb-2">
-                  <input id="paymentSearch" class="form-control" placeholder="Invoice ID" />
-                  <button id="searchPaymentsBtn" class="btn btn-outline-secondary">Search</button>
-                </div>
-                <div id="invoiceResult" class="bg-light p-2 rounded"></div>
-                <div id="paymentResult" class="bg-light p-2 rounded mt-2"></div>
               </div>
+              <div class="table-responsive mb-3">
+                <table class="table table-sm align-middle table-sortable">
+                  <thead>
+                    <tr>
+                      <th data-sort="invoice_number">Invoice</th>
+                      <th data-sort="customer_name">Customer</th>
+                      <th data-sort="amount">Amount</th>
+                      <th data-sort="status">Status</th>
+                      <th data-sort="due_date">Due Date</th>
+                    </tr>
+                  </thead>
+                  <tbody id="invoiceTable"></tbody>
+                </table>
+              </div>
+              <div class="d-flex justify-content-between align-items-center">
+                <small id="invoicePageInfo" class="text-muted">Page 1</small>
+                <div>
+                  <button id="invoicePrev" class="btn btn-outline-secondary btn-sm me-2">Previous</button>
+                  <button id="invoiceNext" class="btn btn-outline-secondary btn-sm">Next</button>
+                </div>
+              </div>
+            </div>
+            <div class="card shadow-sm p-3">
+              <h5>Search invoice</h5>
+              <div class="input-group mb-2">
+                <input id="invoiceSearch" class="form-control" placeholder="Invoice number" />
+                <button id="searchInvoiceBtn" class="btn btn-outline-primary">Search</button>
+              </div>
+              <div id="invoiceResult" class="card card-body bg-light mb-3 d-none"></div>
+            </div>
+          </div>
 
-              <div class="card shadow-sm p-3 mb-3">
-                <h4>Audit logs</h4>
-                <div id="auditLogs"></div>
+          <div id="page-payments" class="page-view d-none">
+            <div class="card shadow-sm p-3 mb-3">
+              <div class="d-flex justify-content-between align-items-center mb-3">
+                <h4 class="mb-0">Payments</h4>
+                <div class="input-group" style="max-width: 380px;">
+                  <input id="paymentTableSearch" class="form-control" placeholder="Search payments" />
+                  <button id="paymentTableClear" class="btn btn-outline-secondary">Clear</button>
+                </div>
               </div>
+              <div class="table-responsive mb-3">
+                <table class="table table-sm align-middle table-sortable">
+                  <thead>
+                    <tr>
+                      <th data-sort="payment_date">Payment Date</th>
+                      <th data-sort="invoice_number">Invoice</th>
+                      <th data-sort="payment_amount">Amount</th>
+                      <th data-sort="reference">Reference</th>
+                      <th data-sort="status">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="paymentTable"></tbody>
+                </table>
+              </div>
+              <div class="d-flex justify-content-between align-items-center">
+                <small id="paymentPageInfo" class="text-muted">Page 1</small>
+                <div>
+                  <button id="paymentPrev" class="btn btn-outline-secondary btn-sm me-2">Previous</button>
+                  <button id="paymentNext" class="btn btn-outline-secondary btn-sm">Next</button>
+                </div>
+              </div>
+            </div>
+            <div class="card shadow-sm p-3">
+              <h5>Search payments by invoice</h5>
+              <div class="input-group mb-2">
+                <input id="paymentSearch" class="form-control" placeholder="Invoice ID" />
+                <button id="searchPaymentsBtn" class="btn btn-outline-secondary">Search</button>
+              </div>
+              <div id="paymentResult" class="card card-body bg-light mb-3 d-none"></div>
+            </div>
+          </div>
+
+          <div id="page-audit" class="page-view d-none">
+            <div class="card shadow-sm p-3 mb-3">
+              <h4>Audit logs</h4>
+              <div id="auditLogs"></div>
+            </div>
+          </div>
+
+          <div id="page-users" class="page-view d-none">
+            <div class="card shadow-sm p-3 mb-3">
+              <h4>Users (Admin)</h4>
+              <p class="text-muted">User management will be available in the next release.</p>
+            </div>
+          </div>
+
+          <div id="page-settings" class="page-view d-none">
+            <div class="card shadow-sm p-3 mb-3">
+              <h4>Settings</h4>
+              <p class="text-muted">Settings and integrations are managed in the backend configuration.</p>
             </div>
           </div>
 

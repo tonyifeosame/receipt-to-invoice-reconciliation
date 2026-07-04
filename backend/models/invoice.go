@@ -62,13 +62,28 @@ type ReviewDecisionRequest struct {
 }
 
 type OCRResponse struct {
+	ReceiptID string          `json:"receipt_id"`
+	RequestID string          `json:"request_id"`
+	OCR       OCRMetadata     `json:"ocr"`
+	Fields    ExtractedFields `json:"fields"`
+	RawText   string          `json:"raw_text"`
+	ImageName string          `json:"image_name"`
+}
+
+type OCRMetadata struct {
+	Confidence       float64 `json:"confidence"`
+	Engine           string  `json:"engine"`
+	ProcessingTimeMs int     `json:"processing_time_ms"`
+}
+
+type ExtractedFields struct {
 	InvoiceNumber string  `json:"invoice_number"`
-	AmountPaid    float64 `json:"amount_paid"`
-	PaymentDate   string  `json:"payment_date"`
-	BankReference string  `json:"bank_reference"`
-	CustomerName  string  `json:"customer_name"`
-	IsValid       bool    `json:"is_valid"`
-	Confidence    float64 `json:"confidence"`
+	Amount        float64 `json:"amount"`
+	Date          string  `json:"date"`
+	Customer      string  `json:"customer"`
+	Reference     string  `json:"reference"`
+	PhoneNumber   string  `json:"phone_number"`
+	Email         string  `json:"email"`
 }
 
 type ReviewItem struct {
@@ -101,4 +116,23 @@ type DashboardResponse struct {
 type ReconcileResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+}
+
+type JobStatusResponse struct {
+	JobID       int        `json:"job_id"`
+	Status      string     `json:"status"`
+	Type        string     `json:"type"`
+	CreatedAt   time.Time  `json:"created_at"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	Error       string     `json:"error,omitempty"`
+	Result      any        `json:"result,omitempty"`
+}
+
+type AuditLogEntry struct {
+	JobID     int       `json:"job_id"`
+	Action    string    `json:"action"`
+	Message   string    `json:"message"`
+	Timestamp time.Time `json:"timestamp"`
+	Metadata  any       `json:"metadata,omitempty"`
 }

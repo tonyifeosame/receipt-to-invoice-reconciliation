@@ -45,7 +45,7 @@ bool Database::connect() {
 
 void Database::disconnect() {
     if (connection_ && connection_->is_open()) {
-        connection_->close();
+        connection_->disconnect();
         LOG_INFO("Disconnected from database");
     }
 }

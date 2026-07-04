@@ -8,6 +8,7 @@ import (
 	"receipt-reconciliation/jobs"
 	"receipt-reconciliation/middleware"
 	"receipt-reconciliation/repository"
+	"receipt-reconciliation/services"
 
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
@@ -37,35 +38,27 @@ func main() {
 		defer db.Close()
 	}
 
-	// Create handlers
-	authHandler := handlers.NewAuthHandler(db, jwtSecret)
-	receiptHandler := handlers.NewReceiptHandler(db)
-	invoiceHandler := handlers.NewInvoiceHandler(db)
-	historyHandler := handlers.NewHistoryHandler(db)
-	dashboardHandler := handlers.NewDashboardHandler(db)
-
-	// Get auth middleware
-	authMiddleware := authHandler.GetAuthMiddleware()
-
 	// Initialize job queue only if database is available
 	var jobQueue *jobs.JobQueue
 	if db != nil {
-		jobQueue = jobs.NewJobQueue(db, 3) // 3 worker goroutines
+		ocrService := services.NewOCRService()
+		companyAPI := services.NewCompanyAPIClient()
+		jobQueue = jobs.NewJobQueue(db, 3, ocrService, companyAPI) // 3 worker goroutines
 
 		// Register job handlers (placeholder implementations)
-		jobQueue.RegisterHandler(jobs.JobOCRProcess, func(job *jobs.Job, db *repository.Database) error {
+		jobQueue.RegisterHandler(jobs.JobOCRProcess, func(job *jobs.Job, db *repository.Database, ocrService services.OCRService, companyAPI *services.CompanyAPIClient) error {
 			log.Printf("Processing OCR job %d", job.ID)
 			// TODO: Implement actual OCR processing
 			return nil
 		})
 
-		jobQueue.RegisterHandler(jobs.JobReconciliation, func(job *jobs.Job, db *repository.Database) error {
+		jobQueue.RegisterHandler(jobs.JobReconciliation, func(job *jobs.Job, db *repository.Database, ocrService services.OCRService, companyAPI *services.CompanyAPIClient) error {
 			log.Printf("Processing reconciliation job %d", job.ID)
 			// TODO: Implement actual reconciliation
 			return nil
 		})
 
-		jobQueue.RegisterHandler(jobs.JobNotification, func(job *jobs.Job, db *repository.Database) error {
+		jobQueue.RegisterHandler(jobs.JobNotification, func(job *jobs.Job, db *repository.Database, ocrService services.OCRService, companyAPI *services.CompanyAPIClient) error {
 			log.Printf("Processing notification job %d", job.ID)
 			// TODO: Implement actual notification
 			return nil
@@ -75,6 +68,16 @@ func main() {
 		go jobQueue.Start()
 		defer jobQueue.Stop()
 	}
+
+	// Create handlers
+	authHandler := handlers.NewAuthHandler(db, jwtSecret)
+	receiptHandler := handlers.NewReceiptHandler(db, jobQueue)
+	invoiceHandler := handlers.NewInvoiceHandler(db)
+	historyHandler := handlers.NewHistoryHandler(db)
+	dashboardHandler := handlers.NewDashboardHandler(db)
+
+	// Get auth middleware
+	authMiddleware := authHandler.GetAuthMiddleware()
 
 	// Create router
 	router := mux.NewRouter()

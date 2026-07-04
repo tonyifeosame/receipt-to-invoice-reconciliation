@@ -1,5 +1,6 @@
 #include "pdf_processor.h"
 #include "logger.h"
+#include <algorithm>
 #include <filesystem>
 #include <sstream>
 #include <iomanip>
