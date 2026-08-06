@@ -2,6 +2,7 @@
 #include "logger.h"
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
+#include <functional>
 
 ImageProcessor::ImageProcessor() {
     LOG_INFO("ImageProcessor initialized");
@@ -22,33 +23,50 @@ cv::Mat ImageProcessor::preprocessImage(const std::string& imagePath) {
     }
     
     LOG_DEBUG("Original image size: " + std::to_string(image.cols) + "x" + std::to_string(image.rows));
-    
+
+    // Each stage is optional: if one fails on an unusual image we keep the best
+    // result produced so far rather than aborting the whole preprocessing run.
+    auto step = [](const char* name, const cv::Mat& input,
+                   const std::function<cv::Mat(const cv::Mat&)>& fn) -> cv::Mat {
+        try {
+            cv::Mat output = fn(input);
+            if (output.empty()) {
+                LOG_WARNING(std::string("Preprocessing step '") + name +
+                            "' produced an empty image, keeping previous result");
+                return input;
+            }
+            return output;
+        } catch (const cv::Exception& e) {
+            LOG_WARNING(std::string("Preprocessing step '") + name + "' failed: " + e.what() +
+                        " - keeping previous result");
+            return input;
+        }
+    };
+
     // Apply enhanced preprocessing pipeline
-    cv::Mat processed = convertToGrayscale(image);
-    processed = advancedDenoise(processed);
-    processed = enhanceContrast(processed);
-    processed = correctRotation(processed);
-    processed = correctPerspective(processed);
-    processed = applyThreshold(processed);
-    processed = morphologicalCleanup(processed);
-    processed = cropToContent(processed);
-    
+    cv::Mat processed = step("grayscale", image, [this](const cv::Mat& m) { return convertToGrayscale(m); });
+    processed = step("denoise", processed, [this](const cv::Mat& m) { return advancedDenoise(m); });
+    processed = step("contrast", processed, [this](const cv::Mat& m) { return enhanceContrast(m); });
+    processed = step("rotation", processed, [this](const cv::Mat& m) { return correctRotation(m); });
+    processed = step("perspective", processed, [this](const cv::Mat& m) { return correctPerspective(m); });
+    processed = step("threshold", processed, [this](const cv::Mat& m) { return applyThreshold(m); });
+    processed = step("morphology", processed, [this](const cv::Mat& m) { return morphologicalCleanup(m); });
+    processed = step("crop", processed, [this](const cv::Mat& m) { return cropToContent(m); });
+
     LOG_INFO("Image preprocessing completed");
     return processed;
 }
 
 cv::Mat ImageProcessor::convertToGrayscale(const cv::Mat& image) {
+    if (image.channels() == 1) {
+        LOG_DEBUG("Image is already grayscale");
+        return image;
+    }
+
     cv::Mat gray;
-    cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(image, gray, image.channels() == 4 ? cv::COLOR_BGRA2GRAY : cv::COLOR_BGR2GRAY);
     LOG_DEBUG("Converted to grayscale");
     return gray;
-}
-
-cv::Mat ImageProcessor::removeNoise(const cv::Mat& image) {
-    cv::Mat denoised;
-    cv::medianBlur(image, denoised, 3);
-    LOG_DEBUG("Noise removed using median blur");
-    return denoised;
 }
 
 cv::Mat ImageProcessor::advancedDenoise(const cv::Mat& image) {
@@ -79,40 +97,41 @@ cv::Mat ImageProcessor::enhanceContrast(const cv::Mat& image) {
 }
 
 cv::Mat ImageProcessor::applyThreshold(const cv::Mat& image) {
+    // Adaptive thresholding adapts to uneven lighting across a photographed
+    // receipt. An Otsu pass used to be computed here as well and then discarded
+    // without ever being used.
     cv::Mat thresholded;
-    
-    // Try Otsu's thresholding first for bimodal images
-    cv::Mat otsu;
-    double otsuThreshold = cv::threshold(image, otsu, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
-    
-    // Also apply adaptive thresholding
-    cv::Mat adaptive;
-    cv::adaptiveThreshold(image, adaptive, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C,
-                         cv::THRESH_BINARY, 15, 8);
-    
-    // Combine both methods - use adaptive for better local adaptation
-    thresholded = adaptive;
-    
+    cv::adaptiveThreshold(image, thresholded, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C,
+                          cv::THRESH_BINARY, 15, 8);
+
     // Apply morphological operations to clean up
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2));
     cv::morphologyEx(thresholded, thresholded, cv::MORPH_CLOSE, kernel);
     
-    LOG_DEBUG("Applied enhanced adaptive thresholding with Otsu fallback");
+    LOG_DEBUG("Applied adaptive thresholding");
     return thresholded;
 }
 
 cv::Mat ImageProcessor::morphologicalCleanup(const cv::Mat& image) {
     cv::Mat cleaned;
-    
-    // Opening: erosion followed by dilation - removes small noise/blobs
-    cv::Mat kernelOpen = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2));
-    cv::morphologyEx(image, cleaned, cv::MORPH_OPEN, kernelOpen);
-    
-    // Closing: dilation followed by erosion - fills holes and reconnects broken characters
-    cv::Mat kernelClose = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-    cv::morphologyEx(cleaned, cleaned, cv::MORPH_CLOSE, kernelClose);
-    
-    LOG_DEBUG("Applied morphological cleanup (opening and closing)");
+
+    // applyThreshold produces dark text on a light background, but OpenCV's
+    // morphology treats *bright* pixels as the foreground. The operations are
+    // therefore the duals of the ones named in a text-as-foreground pipeline:
+    // MORPH_CLOSE removes small dark speckles and MORPH_OPEN reconnects broken
+    // strokes. Running them the other way round erodes the glyphs instead: on a
+    // clean 700x900 receipt it reduced Tesseract's output from the full 17-line
+    // document to just the bold heading, because every regular-weight stroke was
+    // thin enough to be wiped out.
+    cv::Mat kernelDespeckle = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2));
+    cv::morphologyEx(image, cleaned, cv::MORPH_CLOSE, kernelDespeckle);
+
+    // A 2x2 kernel is deliberate here: a 3x3 reconnect merges the two dots of a
+    // colon into a full stop, which costs the parser the "Customer:" label.
+    cv::Mat kernelReconnect = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2));
+    cv::morphologyEx(cleaned, cleaned, cv::MORPH_OPEN, kernelReconnect);
+
+    LOG_DEBUG("Applied morphological cleanup (despeckle and reconnect)");
     return cleaned;
 }
 
@@ -273,44 +292,11 @@ cv::Mat ImageProcessor::rotateImage(const cv::Mat& image, double angle) {
     return rotated;
 }
 
-cv::Mat ImageProcessor::detectReceiptBoundaries(const cv::Mat& image) {
-    cv::Mat blurred;
-    cv::GaussianBlur(image, blurred, cv::Size(5, 5), 0);
-    
-    cv::Mat edges;
-    cv::Canny(blurred, edges, 75, 200);
-    
-    std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-    
-    if (contours.empty()) {
-        LOG_DEBUG("No contours found, returning original image");
-        return image;
-    }
-    
-    std::vector<cv::Point> largestContour = findLargestContour(edges);
-    
-    if (largestContour.size() < 4) {
-        LOG_DEBUG("Largest contour has less than 4 points, returning original image");
-        return image;
-    }
-    
-    // Approximate contour to polygon
-    std::vector<cv::Point> approx;
-    double epsilon = 0.02 * cv::arcLength(largestContour, true);
-    cv::approxPolyDP(largestContour, approx, epsilon, true);
-    
-    if (approx.size() == 4) {
-        LOG_DEBUG("Detected receipt boundaries with 4 corners");
-    }
-    
-    return image;
-}
-
 cv::Mat ImageProcessor::correctPerspective(const cv::Mat& image) {
-    cv::Mat gray;
-    cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
-    
+    // The preprocessing pipeline hands us a single-channel image; converting it
+    // again with COLOR_BGR2GRAY would throw (cvtColor asserts scn == 3 || scn == 4).
+    cv::Mat gray = convertToGrayscale(image);
+
     cv::Mat blurred;
     cv::GaussianBlur(gray, blurred, cv::Size(5, 5), 0);
     
@@ -367,7 +353,14 @@ cv::Mat ImageProcessor::fourPointTransform(const cv::Mat& image, const std::vect
     double heightA = std::sqrt(std::pow(srcPts[1].x - srcPts[2].x, 2) + std::pow(srcPts[1].y - srcPts[2].y, 2));
     double heightB = std::sqrt(std::pow(srcPts[0].x - srcPts[3].x, 2) + std::pow(srcPts[0].y - srcPts[3].y, 2));
     double maxHeight = std::max(heightA, heightB);
-    
+
+    // A degenerate quadrilateral would produce an empty destination size and make
+    // warpPerspective throw; the original image is the safer result.
+    if (maxWidth < 10.0 || maxHeight < 10.0) {
+        LOG_DEBUG("Detected quadrilateral too small for perspective transform");
+        return image;
+    }
+
     // Destination points
     std::vector<cv::Point2f> dstPts = {
         cv::Point2f(0.0f, 0.0f),
@@ -431,12 +424,3 @@ std::vector<cv::Point> ImageProcessor::findLargestContour(const cv::Mat& image) 
     return *maxContour;
 }
 
-bool ImageProcessor::saveImage(const cv::Mat& image, const std::string& outputPath) {
-    bool success = cv::imwrite(outputPath, image);
-    if (success) {
-        LOG_INFO("Image saved to: " + outputPath);
-    } else {
-        LOG_ERROR("Failed to save image to: " + outputPath);
-    }
-    return success;
-}

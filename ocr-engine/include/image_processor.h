@@ -14,18 +14,13 @@ public:
     
     // Individual preprocessing steps
     cv::Mat convertToGrayscale(const cv::Mat& image);
-    cv::Mat removeNoise(const cv::Mat& image);
     cv::Mat applyThreshold(const cv::Mat& image);
     cv::Mat correctRotation(const cv::Mat& image);
-    cv::Mat detectReceiptBoundaries(const cv::Mat& image);
     cv::Mat correctPerspective(const cv::Mat& image);
     cv::Mat enhanceContrast(const cv::Mat& image);
     cv::Mat advancedDenoise(const cv::Mat& image);
     cv::Mat morphologicalCleanup(const cv::Mat& image);
     cv::Mat cropToContent(const cv::Mat& image);
-    
-    // Save processed image
-    bool saveImage(const cv::Mat& image, const std::string& outputPath);
 
 private:
     // Helper methods

@@ -45,13 +45,10 @@ void Logger::log(LogLevel level, const std::string& message) {
         logFile_.flush();
     }
     
-    // Write to console if enabled
+    // Write to console if enabled. Everything goes to stderr: stdout is reserved
+    // for the machine-readable OCR JSON consumed by the backend.
     if (consoleOutput_) {
-        if (level >= LogLevel::ERROR) {
-            std::cerr << fullMessage << std::endl;
-        } else {
-            std::cout << fullMessage << std::endl;
-        }
+        std::cerr << fullMessage << std::endl;
     }
 }
 

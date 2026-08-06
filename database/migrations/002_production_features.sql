@@ -92,11 +92,17 @@ CREATE INDEX IF NOT EXISTS idx_job_queue_created ON job_queue(created_at);
 CREATE OR REPLACE FUNCTION update_processing_metric()
 RETURNS TRIGGER AS $$
 BEGIN
+    -- jsonb_build_object quotes and escapes the value. String concatenation
+    -- produced {"status": MATCHED}, which is not valid JSON, so the cast failed
+    -- and every INSERT into reconciliation_history was rejected.
     INSERT INTO processing_metrics (metric_name, metric_value, metric_type, tags)
-    VALUES ('receipts_processed', 1, 'counter', '{"status": ' || NEW.status || '}'::jsonb);
+    VALUES ('receipts_processed', 1, 'counter', jsonb_build_object('status', NEW.status));
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Dropped first so this migration can be re-applied like the rest of the file.
+DROP TRIGGER IF EXISTS trigger_receipt_processed ON reconciliation_history;
 
 CREATE TRIGGER trigger_receipt_processed
 AFTER INSERT ON reconciliation_history

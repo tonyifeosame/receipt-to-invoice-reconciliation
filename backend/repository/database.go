@@ -80,7 +80,9 @@ func (d *Database) GetDashboardMetrics() (models.DashboardResponse, error) {
 		return models.DashboardResponse{}, err
 	}
 
-	response.RecentHistory, err = d.GetReconciliationHistory()
+	// The dashboard shows a "recent" extract, not the entire history: the full
+	// table is served by the /history endpoint.
+	response.RecentHistory, err = d.getReconciliationHistory(recentHistoryLimit)
 	if err != nil {
 		return models.DashboardResponse{}, err
 	}
@@ -88,9 +90,16 @@ func (d *Database) GetDashboardMetrics() (models.DashboardResponse, error) {
 	return response, nil
 }
 
+// recentUploadWindow is the period the "recent uploads" dashboard tile covers.
+const recentUploadWindow = "24 hours"
+
+// countPendingReviews counts reconciliations still awaiting a review decision.
+// It previously ran the same query as countFailedReconciliations, so the
+// "pending reviews" and "failed" tiles always showed an identical number.
 func (d *Database) countPendingReviews() (int, error) {
 	var count int
-	err := d.db.QueryRow(`SELECT COUNT(*) FROM reconciliation_history WHERE status = 'UNMATCHED'`).Scan(&count)
+	err := d.db.QueryRow(
+		`SELECT COUNT(*) FROM reconciliation_history WHERE review_status = 'PENDING_REVIEW'`).Scan(&count)
 	return count, err
 }
 
@@ -106,9 +115,13 @@ func (d *Database) countFailedReconciliations() (int, error) {
 	return count, err
 }
 
+// countRecentUploads counts uploads inside the recent window. It used to count
+// every payment ever recorded, so the tile was a lifetime total labelled
+// "recent" and only ever grew.
 func (d *Database) countRecentUploads() (int, error) {
 	var count int
-	err := d.db.QueryRow(`SELECT COUNT(*) FROM payments`).Scan(&count)
+	err := d.db.QueryRow(
+		`SELECT COUNT(*) FROM payments WHERE created_at >= NOW() - INTERVAL '` + recentUploadWindow + `'`).Scan(&count)
 	return count, err
 }
 
@@ -254,11 +267,35 @@ func (d *Database) CreateReconciliationRecord(invoiceNumber, receiptName, status
 	return err
 }
 
+// recentHistoryLimit is how many reconciliation records the dashboard shows.
+const recentHistoryLimit = 10
+
+// GetReconciliationHistory returns the full reconciliation history.
 func (d *Database) GetReconciliationHistory() ([]models.ReconciliationRecord, error) {
-	query := `SELECT id, invoice_number, receipt_name, status, matched_at 
+	return d.getReconciliationHistory(0)
+}
+
+// getReconciliationHistory returns the history, newest first, optionally capped
+// at limit rows (limit <= 0 returns everything).
+func (d *Database) getReconciliationHistory(limit int) ([]models.ReconciliationRecord, error) {
+	// main.go keeps serving with a nil *Database when the database is
+	// unavailable ("demo mode"), so every exported read has to tolerate it the
+	// way GetDashboardMetrics does. Without this guard GET /history panicked the
+	// request goroutine on a nil dereference and dropped the connection.
+	if d == nil || d.db == nil {
+		return nil, nil
+	}
+
+	query := `SELECT id, invoice_number, receipt_name, status, matched_at
 	          FROM reconciliation_history ORDER BY matched_at DESC`
 
-	rows, err := d.db.Query(query)
+	args := []interface{}{}
+	if limit > 0 {
+		query += ` LIMIT $1`
+		args = append(args, limit)
+	}
+
+	rows, err := d.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +323,13 @@ func (d *Database) CreateAuditLog(action, description, userName string) error {
 }
 
 func (d *Database) GetAuditLogs() ([]models.AuditLog, error) {
-	query := `SELECT id, action, description, user_name, timestamp 
+	// Reachable with a nil *Database from GET /audit-logs in demo mode; see the
+	// note on getReconciliationHistory.
+	if d == nil || d.db == nil {
+		return nil, nil
+	}
+
+	query := `SELECT id, action, description, user_name, timestamp
 	          FROM audit_logs ORDER BY timestamp DESC LIMIT 100`
 
 	rows, err := d.db.Query(query)

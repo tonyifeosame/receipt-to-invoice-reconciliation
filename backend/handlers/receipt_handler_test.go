@@ -9,49 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"receipt-reconciliation/models"
 )
-
-// Mock database for testing
-type mockDatabase struct{}
-
-func (m *mockDatabase) GetInvoiceByNumber(invoiceNumber string) (models.Invoice, error) {
-	return models.Invoice{
-		ID:            1,
-		InvoiceNumber: invoiceNumber,
-		CustomerName:  "Test Customer",
-		Amount:        1500.00,
-		Status:        "PENDING",
-		DueDate:       "2026-07-15",
-		CreatedAt:     time.Now(),
-	}, nil
-}
-
-func (m *mockDatabase) IsDuplicatePayment(invoiceNumber, reference string) (bool, error) {
-	return false, nil
-}
-
-func (m *mockDatabase) UpdateInvoiceStatus(invoiceNumber, status string) error {
-	return nil
-}
-
-func (m *mockDatabase) UpdateInvoiceBalance(invoiceNumber string, paymentAmount float64) error {
-	return nil
-}
-
-func (m *mockDatabase) CreatePayment(payment models.Payment) error {
-	return nil
-}
-
-func (m *mockDatabase) CreateReconciliationRecord(invoiceNumber, receiptName, status string) error {
-	return nil
-}
-
-func (m *mockDatabase) CreateAuditLog(action, description, userName string) error {
-	return nil
-}
 
 func TestReceiptHandler_UploadReceipt(t *testing.T) {
 	handler := &ReceiptHandler{}
@@ -81,6 +41,9 @@ func TestReceiptHandler_UploadReceipt(t *testing.T) {
 
 func TestReceiptHandler_UploadReceiptMultipart(t *testing.T) {
 	handler := &ReceiptHandler{}
+
+	uploadDir := filepath.Join(t.TempDir(), "receipts")
+	t.Setenv("RECEIPTS_DIR", uploadDir)
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -124,6 +87,28 @@ func TestReceiptHandler_UploadReceiptMultipart(t *testing.T) {
 	if _, err := os.Stat(response["file_path"]); err != nil {
 		t.Fatalf("expected uploaded file to be stored, got error: %v", err)
 	}
+
+	if filepath.Dir(response["file_path"]) != uploadDir {
+		t.Fatalf("expected receipt to be stored in %s, got %s", uploadDir, response["file_path"])
+	}
+}
+
+// stageReceipt points RECEIPTS_DIR at a temporary directory containing a receipt
+// and returns its path. OCR requests must reference a file inside that directory.
+func stageReceipt(t *testing.T, name string) string {
+	t.Helper()
+
+	dir := filepath.Join(t.TempDir(), "receipts")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("failed to create receipts dir: %v", err)
+	}
+	t.Setenv("RECEIPTS_DIR", dir)
+
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("receipt bytes"), 0o644); err != nil {
+		t.Fatalf("failed to stage receipt: %v", err)
+	}
+	return path
 }
 
 type stubOCRService struct {
@@ -136,6 +121,8 @@ func (s *stubOCRService) ProcessFile(filePath string) (models.OCRResponse, error
 }
 
 func TestReceiptHandler_ProcessOCR(t *testing.T) {
+	receiptPath := stageReceipt(t, "receipt.jpg")
+
 	handler := &ReceiptHandler{ocr: &stubOCRService{response: models.OCRResponse{
 		ReceiptID: "REC-001",
 		RequestID: "REQ-123",
@@ -156,7 +143,7 @@ func TestReceiptHandler_ProcessOCR(t *testing.T) {
 	}}}
 
 	reqBody := map[string]string{
-		"receipt_file": "/path/to/receipt.jpg",
+		"receipt_file": receiptPath,
 	}
 	jsonBody, _ := json.Marshal(reqBody)
 
@@ -181,6 +168,8 @@ func TestReceiptHandler_ProcessOCR(t *testing.T) {
 }
 
 func TestReceiptHandler_ProcessOCR_LowConfidenceReview(t *testing.T) {
+	receiptPath := stageReceipt(t, "receipt.jpg")
+
 	handler := &ReceiptHandler{ocr: &stubOCRService{response: models.OCRResponse{
 		ReceiptID: "REC-001",
 		RequestID: "REQ-123",
@@ -201,7 +190,7 @@ func TestReceiptHandler_ProcessOCR_LowConfidenceReview(t *testing.T) {
 	}}}
 
 	reqBody := map[string]string{
-		"receipt_file": "/path/to/receipt.jpg",
+		"receipt_file": receiptPath,
 	}
 	jsonBody, _ := json.Marshal(reqBody)
 
@@ -227,7 +216,7 @@ func TestReceiptHandler_ProcessOCR_LowConfidenceReview(t *testing.T) {
 }
 
 func TestReceiptHandler_Reconcile(t *testing.T) {
-	handler := &ReceiptHandler{db: &mockDatabase{}}
+	handler := &ReceiptHandler{}
 
 	reqBody := map[string]interface{}{
 		"invoice_number": "INV-001",
@@ -253,7 +242,13 @@ func TestReceiptHandler_Reconcile(t *testing.T) {
 		t.Fatalf("Expected valid JSON response: %v", err)
 	}
 
-	if !response.Success {
-		t.Fatalf("Expected reconciliation to succeed, got %+v", response)
+	// Reconciliation is owned by the company API. The backend must not decide the
+	// outcome itself, so the endpoint reports that the request was not handled here.
+	if response.Success {
+		t.Fatalf("Expected reconciliation to be delegated to the company API, got %+v", response)
+	}
+
+	if response.Message == "" {
+		t.Fatalf("Expected an explanatory message, got %+v", response)
 	}
 }

@@ -13,8 +13,20 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database/migrations:/docker-entrypoint-initdb.d
-      - ./database/seed.sql:/docker-entrypoint-initdb.d/seed.sql
+      # Each init script is mounted individually rather than bind-mounting
+      # ./database/migrations onto /docker-entrypoint-initdb.d and nesting
+      # seed.sql inside it. With the directory bind-mounted, Docker had to
+      # materialise the nested mount target on the host, so every `up` left an
+      # empty database/migrations/seed.sql behind in the working tree. Mounting
+      # the files one by one keeps /docker-entrypoint-initdb.d in the image's own
+      # layer, so nothing is written back to the repository.
+      #
+      # Postgres runs these in glob (lexicographic) order, so the numeric
+      # prefixes decide when each one applies. NOTE: a new migration must be
+      # added here as well, or it will not run on a fresh database.
+      - ./database/migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - ./database/migrations/002_production_features.sql:/docker-entrypoint-initdb.d/002_production_features.sql:ro
+      - ./database/seed.sql:/docker-entrypoint-initdb.d/003_seed.sql:ro
     networks:
       - receipt-network
     healthcheck:
@@ -37,6 +49,7 @@ services:
       DB_PASSWORD: postgres
       JWT_SECRET: change-me-in-production
       PORT: 8080
+      RECEIPTS_DIR: /app/receipts
     ports:
       - "8080:8080"
     depends_on:
@@ -57,13 +70,19 @@ services:
       context: ./ocr-engine
       dockerfile: Dockerfile
     container_name: receipt-ocr-engine
-    restart: unless-stopped
+    # The engine is a batch CLI: it processes the receipts directory and exits 0.
+    # "unless-stopped" restarted it immediately every time it finished, leaving
+    # the container in a permanent restart loop that reprocessed every receipt
+    # and made the service look perpetually unhealthy. It is run on demand, so
+    # only restart it when it exits with a failure, and give up after 3 tries.
+    restart: on-failure:3
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_NAME: receipt_reconciliation
       DB_USER: postgres
       DB_PASSWORD: postgres
+      RECEIPTS_DIR: /app/receipts
     depends_on:
       postgres:
         condition: service_healthy

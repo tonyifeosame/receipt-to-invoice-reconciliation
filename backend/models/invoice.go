@@ -46,21 +46,6 @@ type OCRProcessRequest struct {
 	ReceiptFile string `json:"receipt_file"`
 }
 
-type ReconcileRequest struct {
-	InvoiceNumber string  `json:"invoice_number"`
-	AmountPaid    float64 `json:"amount_paid"`
-	PaymentDate   string  `json:"payment_date"`
-	Reference     string  `json:"reference"`
-	ReceiptFile   string  `json:"receipt_file"`
-}
-
-type ReviewDecisionRequest struct {
-	InvoiceNumber string `json:"invoice_number"`
-	ReceiptFile   string `json:"receipt_file"`
-	Decision      string `json:"decision"`
-	Reason        string `json:"reason"`
-}
-
 type OCRResponse struct {
 	ReceiptID string          `json:"receipt_id"`
 	RequestID string          `json:"request_id"`
@@ -86,16 +71,6 @@ type ExtractedFields struct {
 	Email         string  `json:"email"`
 }
 
-type ReviewItem struct {
-	ID            int     `json:"id"`
-	ReceiptFile   string  `json:"receipt_file"`
-	InvoiceNumber string  `json:"invoice_number"`
-	AmountPaid    float64 `json:"amount_paid"`
-	Confidence    float64 `json:"confidence"`
-	Status        string  `json:"status"`
-	Reason        string  `json:"reason"`
-}
-
 type DailyReconciliationStats struct {
 	Date      string `json:"date"`
 	Matched   int    `json:"matched"`
@@ -116,23 +91,4 @@ type DashboardResponse struct {
 type ReconcileResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
-}
-
-type JobStatusResponse struct {
-	JobID       int        `json:"job_id"`
-	Status      string     `json:"status"`
-	Type        string     `json:"type"`
-	CreatedAt   time.Time  `json:"created_at"`
-	StartedAt   *time.Time `json:"started_at,omitempty"`
-	CompletedAt *time.Time `json:"completed_at,omitempty"`
-	Error       string     `json:"error,omitempty"`
-	Result      any        `json:"result,omitempty"`
-}
-
-type AuditLogEntry struct {
-	JobID     int       `json:"job_id"`
-	Action    string    `json:"action"`
-	Message   string    `json:"message"`
-	Timestamp time.Time `json:"timestamp"`
-	Metadata  any       `json:"metadata,omitempty"`
 }

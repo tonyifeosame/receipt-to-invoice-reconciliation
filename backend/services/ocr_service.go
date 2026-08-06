@@ -1,14 +1,17 @@
 package services
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"receipt-reconciliation/models"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -28,6 +31,8 @@ func NewNativeOCREngine() *NativeOCREngine {
 			filepath.Join("..", "ocr-engine", "build", "Release", "ocr_engine"),
 			filepath.Join("..", "ocr-engine", "build", "ocr_engine.exe"),
 			filepath.Join("..", "ocr-engine", "build", "Release", "ocr_engine.exe"),
+			filepath.Join("/app", "ocr-engine", "build", "ocr_engine"),
+			filepath.Join("/usr", "local", "bin", "ocr_engine"),
 		}
 		if runtime.GOOS == "windows" {
 			candidates = append(candidates, filepath.Join("..", "ocr-engine", "build", "Debug", "ocr_engine.exe"))
@@ -59,18 +64,49 @@ func (n *NativeOCREngine) ProcessFile(filePath string) (models.OCRResponse, erro
 		return models.OCRResponse{}, fmt.Errorf("OCR engine binary not found: %w", err)
 	}
 
-	cmd := exec.Command(n.enginePath, filePath)
-	output, err := cmd.CombinedOutput()
+	// The engine resolves relative paths against its own working directory, so hand
+	// it an absolute path to the receipt.
+	absPath, err := filepath.Abs(filePath)
 	if err != nil {
-		return models.OCRResponse{}, fmt.Errorf("ocr engine failed: %w: %s", err, string(output))
+		absPath = filePath
 	}
 
+	// "--file" selects single-file mode; without it the engine batch-processes its
+	// configured receipts directory and never emits a per-receipt JSON document.
+	cmd := exec.Command(n.enginePath, "--file", absPath)
+
+	// stdout carries only the OCR JSON; logs and the banner go to stderr and must
+	// never be mixed into the document we parse.
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+
 	var response models.OCRResponse
-	if err := json.Unmarshal(output, &response); err != nil {
-		return models.OCRResponse{}, fmt.Errorf("failed to parse OCR response: %w", err)
+	if parseErr := json.Unmarshal(stdout.Bytes(), &response); parseErr != nil {
+		if runErr != nil {
+			return models.OCRResponse{}, fmt.Errorf("ocr engine failed: %w: %s", runErr, truncate(stderr.String()))
+		}
+		return models.OCRResponse{}, fmt.Errorf("failed to parse OCR response: %w: %s", parseErr, truncate(stdout.String()))
+	}
+
+	// A non-zero exit with a well-formed document means the engine could not extract
+	// anything useful. That is still a result for the company API to judge, so it is
+	// returned rather than discarded.
+	if runErr != nil {
+		log.Printf("OCR engine reported a failed extraction for %s: %v: %s", absPath, runErr, truncate(stderr.String()))
 	}
 
 	return response, nil
+}
+
+func truncate(s string) string {
+	const maxLen = 2000
+	s = strings.TrimSpace(s)
+	if len(s) > maxLen {
+		return s[:maxLen] + "... (truncated)"
+	}
+	return s
 }
 
 type FallbackOCREngine struct{}

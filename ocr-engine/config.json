@@ -10,6 +10,6 @@
     "data_path": "",
     "language": "eng"
   },
-  "receiptsDir": "receipts",
+  "receipts_dir": "../receipts",
   "log_file": "ocr_engine.log"
 }

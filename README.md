@@ -41,35 +41,47 @@ Invoice Records      Audit Logs
 receipt-reconciliation/
 ├── ocr-engine/              # C++ OCR processing engine
 │   ├── include/            # Header files
-│   │   ├── image_processor.h
-│   │   ├── ocr_engine.h
-│   │   ├── receipt_parser.h
 │   │   ├── database.h
-│   │   └── logger.h
+│   │   ├── file_utils.h
+│   │   ├── image_processor.h
+│   │   ├── logger.h
+│   │   ├── ocr_engine.h
+│   │   ├── pdf_processor.h
+│   │   └── receipt_parser.h
 │   ├── src/                # Implementation files
-│   │   ├── image_processor.cpp
-│   │   ├── ocr_engine.cpp
-│   │   ├── receipt_parser.cpp
 │   │   ├── database.cpp
+│   │   ├── file_utils.cpp
+│   │   ├── image_processor.cpp
 │   │   ├── logger.cpp
-│   │   └── main.cpp
+│   │   ├── main.cpp
+│   │   ├── ocr_engine.cpp
+│   │   ├── pdf_processor.cpp
+│   │   └── receipt_parser.cpp
+│   ├── tests/              # Parser unit tests and accuracy harness
 │   ├── CMakeLists.txt
 │   ├── config.json
 │   └── Dockerfile
 ├── backend/                 # Go REST API
+│   ├── frontend/           # Static finance dashboard (HTML/JS)
 │   ├── handlers/           # HTTP handlers
-│   ├── middleware/         # HTTP middleware
+│   ├── jobs/               # Background job queue
+│   ├── metrics/            # Prometheus exposition
+│   ├── middleware/         # HTTP middleware (auth, CORS, instrumentation)
 │   ├── models/             # Data models
 │   ├── repository/         # Database layer
+│   ├── services/           # OCR engine and company API clients
 │   ├── main.go
 │   ├── go.mod
 │   ├── .env.example
 │   └── Dockerfile
 ├── database/               # Database schema
 │   ├── migrations/
-│   │   └── 001_init.sql
+│   │   ├── 001_init.sql
+│   │   └── 002_production_features.sql
 │   └── seed.sql
-├── receipts/               # Receipt images directory
+├── monitoring/             # Prometheus and Alertmanager configuration
+├── ci/                     # CI workflow
+├── receipts/               # Receipt images directory (not committed)
 ├── docs/                   # Documentation
 ├── docker-compose.yml
 └── README.md
@@ -85,35 +97,32 @@ receipt-reconciliation/
 ### OCR Processing
 - **OpenCV preprocessing:**
   - Convert to grayscale
-  - Remove noise
-  - Apply thresholding
-  - Correct image rotation
-  - Detect receipt boundaries
+  - Denoise and enhance contrast
+  - Correct rotation and perspective
+  - Apply adaptive thresholding
+  - Crop to content
 - **Tesseract extraction:**
   - Invoice Number
   - Amount Paid
   - Payment Date
   - Bank Reference
   - Customer Name (optional)
+  - Phone number and email (when present)
+  - Raw OCR text, always returned alongside the extracted fields
 
-### Invoice Matching
-- Search PostgreSQL for the invoice
-- Match by invoice number
-- Validate payment amount
-- Detect duplicate payments
-- Flag unmatched receipts
+### Matching and Reconciliation
 
-### Automatic Reconciliation
-- Mark invoice as paid
-- Save payment details
-- Update invoice balance
-- Prevent duplicate reconciliation
+Matching, reconciliation and approval decisions are **owned by the external
+company API**, not by this backend. The backend extracts every field it can and
+forwards the complete OCR result; the company system decides whether a receipt is
+approved or rejected.
+
+The `/reconcile` and `/reviews/decision` endpoints remain for backwards
+compatibility and report that the decision belongs to the company API.
 
 ### Reconciliation History
-- View processed receipts
-- Search reconciliation records
-- Export reports
-- Filter by date or invoice
+- View processed receipts recorded by this service
+- Audit trail of receipt processing activity
 
 ### Audit Logs
 - Record every important action:
@@ -126,16 +135,24 @@ receipt-reconciliation/
 
 ## REST API Endpoints
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/receipts/upload` | Upload receipt image |
-| POST | `/ocr/process` | Process OCR on receipt |
-| POST | `/reconcile` | Reconcile payment with invoice |
-| GET | `/history` | Get reconciliation history |
-| GET | `/payments` | Get payment records |
-| GET | `/audit-logs` | Get audit logs |
-| GET | `/invoices` | Get invoice details |
-| GET | `/health` | Health check |
+Endpoints other than `/auth/*`, `/health` and `/metrics` require a bearer token
+obtained from `/auth/login`.
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | `/auth/login` | public | Obtain a JWT |
+| POST | `/auth/register` | public | Create an account (see Security below) |
+| GET | `/health` | public | Health check |
+| GET | `/metrics` | public | Prometheus metrics |
+| POST | `/receipts/upload` | token | Upload receipt image |
+| POST | `/ocr/process` | token | Run OCR and forward the result to the company API |
+| GET | `/invoices` | token | Get invoice details |
+| GET | `/payments` | token | Get payment records |
+| GET | `/history` | token | Get reconciliation history |
+| GET | `/audit-logs` | token | Get audit logs |
+| GET | `/dashboard` | token | Dashboard metrics |
+| POST | `/reconcile` | token | Reports that reconciliation is owned by the company API |
+| POST | `/reviews/decision` | token | Reports that review decisions are owned by the company API |
 
 ## Database Schema
 
@@ -186,7 +203,7 @@ receipt-reconciliation/
 - nlohmann/json library
 
 **Go Backend:**
-- Go 1.21+
+- Go 1.25+ (see `backend/go.mod`)
 - PostgreSQL driver
 
 **Database:**
@@ -325,14 +342,18 @@ make
 Using the C++ OCR engine:
 ```bash
 cd ocr-engine/build
-./ocr_engine config.json ../receipts/receipt.jpg
+./ocr_engine --file ../receipts/receipt.jpg
 ```
+
+In single-file mode the extracted OCR JSON is written to stdout and nothing else;
+all logging goes to stderr and to the log file. This is how the Go backend invokes
+the engine. Pass `--config <path>` to use a specific config file.
 
 ### Processing All Receipts in Directory
 
 ```bash
 cd ocr-engine/build
-./ocr_engine config.json
+./ocr_engine
 ```
 
 ### Using the REST API
@@ -405,7 +426,7 @@ Edit `ocr-engine/config.json`:
 
 ### Go Backend Configuration
 
-Edit `backend/.env`:
+Copy `backend/.env.example` to `backend/.env` and adjust:
 
 ```
 DB_HOST=localhost
@@ -414,7 +435,24 @@ DB_NAME=receipt_reconciliation
 DB_USER=postgres
 DB_PASSWORD=postgres
 PORT=8080
+
+# Signing key for API tokens. There is no built-in default: leave it unset and a
+# random key is generated per process. Required when APP_ENV=production.
+# Generate one with: openssl rand -hex 32
+JWT_SECRET=
+
+# Set to "production" to require a real JWT_SECRET and disable the demo account.
+APP_ENV=
+
+# Where uploaded receipts are stored and where the OCR engine reads them from.
+RECEIPTS_DIR=receipts
+
+# External company API that owns matching and approval decisions.
+COMPANY_API_URL=https://api.company.example.com
+COMPANY_API_KEY=your-company-api-key
 ```
+
+`backend/.env.example` is the authoritative list of supported variables.
 
 ## Development Phases
 

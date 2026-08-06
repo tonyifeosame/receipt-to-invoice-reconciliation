@@ -1,6 +1,9 @@
 package handlers
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,42 +15,146 @@ import (
 	"receipt-reconciliation/jobs"
 	"receipt-reconciliation/models"
 	"receipt-reconciliation/services"
-	"strconv"
+	"regexp"
 	"strings"
+	"time"
 )
-
-type InvoiceRepository interface {
-	GetInvoiceByNumber(string) (models.Invoice, error)
-	IsDuplicatePayment(string, string) (bool, error)
-	UpdateInvoiceStatus(string, string) error
-	UpdateInvoiceBalance(string, float64) error
-	CreatePayment(models.Payment) error
-	CreateReconciliationRecord(string, string, string) error
-	CreateAuditLog(string, string, string) error
-}
 
 type OCRService interface {
 	ProcessFile(string) (models.OCRResponse, error)
 }
 
 type CompanyAPIService interface {
-	SendOCRResults(models.OCRResponse) (*services.CompanyAPIResponse, error)
+	SendOCRResultsContext(context.Context, models.OCRResponse) (*services.CompanyAPIResponse, error)
 }
 
 type ReceiptHandler struct {
-	db       InvoiceRepository
 	ocr      OCRService
 	company  CompanyAPIService
 	jobQueue *jobs.JobQueue
 }
 
-func NewReceiptHandler(db InvoiceRepository, jobQueue *jobs.JobQueue) *ReceiptHandler {
+// NewReceiptHandler builds the receipt handler. Reconciliation and review
+// decisions belong to the company API, so this handler holds no repository:
+// it runs OCR and forwards the result.
+func NewReceiptHandler(jobQueue *jobs.JobQueue) *ReceiptHandler {
 	return &ReceiptHandler{
-		db:       db,
 		ocr:      services.NewOCRService(),
 		company:  services.NewCompanyAPIClient(),
 		jobQueue: jobQueue,
 	}
+}
+
+// receiptsDir resolves the directory uploads are written to. It defaults to the
+// "receipts" directory next to the running binary, which is where the Docker image
+// mounts the shared receipts volume (/app/receipts), and can be overridden with
+// RECEIPTS_DIR. The OCR engine reads receipts from this same location.
+func receiptsDir() string {
+	if dir := os.Getenv("RECEIPTS_DIR"); dir != "" {
+		return dir
+	}
+	return "receipts"
+}
+
+// allowedReceiptExtensions are the file types the OCR engine accepts.
+var allowedReceiptExtensions = map[string]bool{
+	".jpg":  true,
+	".jpeg": true,
+	".png":  true,
+	".pdf":  true,
+}
+
+// safeStemPattern strips anything that is not a plain filename character so that
+// the stored name cannot carry path separators, traversal sequences or shell
+// metacharacters into the OCR engine's argument list.
+var safeStemPattern = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+// uniqueFileName derives a collision-free storage name from the uploaded name.
+// Storing under the client-supplied name let one upload silently overwrite an
+// earlier receipt simply by reusing its filename.
+func uniqueFileName(originalName string) (string, error) {
+	base := filepath.Base(originalName)
+	ext := strings.ToLower(filepath.Ext(base))
+	if !allowedReceiptExtensions[ext] {
+		return "", fmt.Errorf("unsupported file type")
+	}
+
+	stem := safeStemPattern.ReplaceAllString(strings.TrimSuffix(base, filepath.Ext(base)), "_")
+	stem = strings.Trim(stem, "._-")
+	if len(stem) > 60 {
+		stem = stem[:60]
+	}
+	if stem == "" {
+		stem = "receipt"
+	}
+
+	suffix := make([]byte, 8)
+	if _, err := rand.Read(suffix); err != nil {
+		return "", fmt.Errorf("failed to generate a unique file name: %w", err)
+	}
+
+	return fmt.Sprintf("%s-%s-%s%s", stem, time.Now().UTC().Format("20060102T150405"), hex.EncodeToString(suffix), ext), nil
+}
+
+// resolveReceiptPath validates a client-supplied receipt path and returns its
+// absolute location. The path is attacker-controlled and used to open files and
+// to build the OCR engine's arguments, so it must be confined to the receipts
+// directory: without this check "../../etc/passwd" or any absolute path was read
+// straight off the host.
+func resolveReceiptPath(requested string) (string, error) {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return "", fmt.Errorf("receipt file path is required")
+	}
+
+	if strings.ContainsRune(requested, '\x00') {
+		return "", fmt.Errorf("invalid receipt file path")
+	}
+
+	if !allowedReceiptExtensions[strings.ToLower(filepath.Ext(requested))] {
+		return "", fmt.Errorf("unsupported file type")
+	}
+
+	baseDir, err := filepath.Abs(receiptsDir())
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve receipts directory: %w", err)
+	}
+
+	candidate, err := filepath.Abs(requested)
+	if err != nil {
+		return "", fmt.Errorf("invalid receipt file path")
+	}
+
+	if !isWithinDir(baseDir, candidate) {
+		return "", fmt.Errorf("receipt file must be inside the receipts directory")
+	}
+
+	// Resolve symlinks so a link planted inside the receipts directory cannot
+	// point the OCR engine at a file outside it.
+	if resolved, err := filepath.EvalSymlinks(candidate); err == nil {
+		resolvedBase, baseErr := filepath.EvalSymlinks(baseDir)
+		if baseErr != nil {
+			resolvedBase = baseDir
+		}
+		if !isWithinDir(resolvedBase, resolved) {
+			return "", fmt.Errorf("receipt file must be inside the receipts directory")
+		}
+		candidate = resolved
+	}
+
+	return candidate, nil
+}
+
+// isWithinDir reports whether target sits inside baseDir.
+func isWithinDir(baseDir, target string) bool {
+	rel, err := filepath.Rel(baseDir, target)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
 
 func (h *ReceiptHandler) UploadReceipt(w http.ResponseWriter, r *http.Request) {
@@ -81,28 +188,21 @@ func (h *ReceiptHandler) UploadReceipt(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	uploadDir := filepath.Join("..", "receipts")
+	uploadDir := receiptsDir()
 	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
 		http.Error(w, "Failed to prepare upload directory", http.StatusInternalServerError)
 		return
 	}
 
-	ext := strings.ToLower(filepath.Ext(header.Filename))
-	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".pdf" {
+	if !allowedReceiptExtensions[strings.ToLower(filepath.Ext(header.Filename))] {
 		http.Error(w, "Unsupported file type", http.StatusBadRequest)
 		return
 	}
 
-	targetPath := filepath.Join(uploadDir, header.Filename)
-	storedFile, err := os.Create(targetPath)
+	targetPath, err := saveUploadedFile(file, header, uploadDir)
 	if err != nil {
+		log.Printf("Failed to store uploaded receipt: %v", err)
 		http.Error(w, "Failed to save uploaded file", http.StatusInternalServerError)
-		return
-	}
-	defer storedFile.Close()
-
-	if _, err := io.Copy(storedFile, file); err != nil {
-		http.Error(w, "Failed to write uploaded file", http.StatusInternalServerError)
 		return
 	}
 
@@ -117,8 +217,16 @@ func (h *ReceiptHandler) UploadReceipt(w http.ResponseWriter, r *http.Request) {
 }
 
 func saveUploadedFile(file multipart.File, header *multipart.FileHeader, uploadDir string) (string, error) {
-	targetPath := filepath.Join(uploadDir, header.Filename)
-	storedFile, err := os.Create(targetPath)
+	fileName, err := uniqueFileName(header.Filename)
+	if err != nil {
+		return "", err
+	}
+
+	targetPath := filepath.Join(uploadDir, fileName)
+
+	// O_EXCL so an unexpected name clash fails loudly instead of overwriting a
+	// receipt that is already stored.
+	storedFile, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return "", fmt.Errorf("failed to create destination file: %w", err)
 	}
@@ -143,12 +251,21 @@ func (h *ReceiptHandler) ProcessOCR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("OCR processing requested for: %s", req.ReceiptFile)
+	// The requested path is attacker-controlled and is handed to the OCR engine,
+	// so confine it to the receipts directory before it is used or stored.
+	receiptPath, err := resolveReceiptPath(req.ReceiptFile)
+	if err != nil {
+		log.Printf("Rejected OCR request for %q: %v", req.ReceiptFile, err)
+		http.Error(w, "Invalid receipt file", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("OCR processing requested for: %s", receiptPath)
 
 	// Create job for asynchronous processing
 	if h.jobQueue != nil {
 		payload := map[string]interface{}{
-			"receipt_file": req.ReceiptFile,
+			"receipt_file": receiptPath,
 			"request_id":   services.GenerateRequestID(),
 		}
 		jobID, err := h.jobQueue.Enqueue(jobs.JobOCRProcess, payload, 1)
@@ -157,7 +274,7 @@ func (h *ReceiptHandler) ProcessOCR(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Failed to create job", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("OCR job created: %d for receipt: %s", jobID, req.ReceiptFile)
+		log.Printf("OCR job created: %d for receipt: %s", jobID, receiptPath)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"job_id": jobID, "status": "queued"})
 		return
@@ -168,7 +285,7 @@ func (h *ReceiptHandler) ProcessOCR(w http.ResponseWriter, r *http.Request) {
 		h.ocr = services.NewOCRService()
 	}
 
-	response, err := h.ocr.ProcessFile(req.ReceiptFile)
+	response, err := h.ocr.ProcessFile(receiptPath)
 	if err != nil {
 		log.Printf("OCR processing failed: %v", err)
 		http.Error(w, "OCR processing failed", http.StatusInternalServerError)
@@ -176,14 +293,16 @@ func (h *ReceiptHandler) ProcessOCR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set receipt ID and image name from file path
-	response.ReceiptID = filepath.Base(req.ReceiptFile)
-	response.ImageName = filepath.Base(req.ReceiptFile)
+	response.ReceiptID = filepath.Base(receiptPath)
+	response.ImageName = filepath.Base(receiptPath)
 
 	// Send OCR results to company API
 	if h.company != nil {
-		companyResponse, err := h.company.SendOCRResults(response)
+		companyResponse, err := h.company.SendOCRResultsContext(r.Context(), response)
 		if err != nil {
-			log.Printf("Failed to send OCR results to company API: %v", err)
+			// The OCR result is still returned so the caller keeps the extraction
+			// and can see why the company API did not accept it.
+			log.Printf("Failed to send OCR results to company API (receipt %s): %v", response.ReceiptID, err)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{
 				"ocr_results":      response,
@@ -216,40 +335,6 @@ func (h *ReceiptHandler) ReviewDecision(w http.ResponseWriter, r *http.Request) 
 		"success": false,
 		"message": "Review decisions are now handled by the company API. Please use the company's system for approval/rejection decisions.",
 	})
-}
-
-func (h *ReceiptHandler) GetJobStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	jobIDStr := r.URL.Query().Get("job_id")
-	if jobIDStr == "" {
-		http.Error(w, "job_id parameter is required", http.StatusBadRequest)
-		return
-	}
-
-	jobID, err := strconv.Atoi(jobIDStr)
-	if err != nil {
-		http.Error(w, "Invalid job_id", http.StatusBadRequest)
-		return
-	}
-
-	// Query job status from database
-	if h.db != nil {
-		// This would need to be implemented in the repository
-		// For now, return a placeholder response
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"job_id":  jobID,
-			"status":  "unknown",
-			"message": "Job status query not yet implemented",
-		})
-		return
-	}
-
-	http.Error(w, "Database not available", http.StatusInternalServerError)
 }
 
 func (h *ReceiptHandler) Reconcile(w http.ResponseWriter, r *http.Request) {

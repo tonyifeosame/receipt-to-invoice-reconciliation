@@ -1,14 +1,21 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"receipt-reconciliation/handlers"
 	"receipt-reconciliation/jobs"
+	"receipt-reconciliation/metrics"
 	"receipt-reconciliation/middleware"
 	"receipt-reconciliation/repository"
 	"receipt-reconciliation/services"
+	"strings"
+	"syscall"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
@@ -26,7 +33,7 @@ func main() {
 	dbName := getEnv("DB_NAME", "receipt_reconciliation")
 	dbUser := getEnv("DB_USER", "postgres")
 	dbPassword := getEnv("DB_PASSWORD", "postgres")
-	jwtSecret := getEnv("JWT_SECRET", "your-secret-key-change-in-production")
+	jwtSecret := resolveJWTSecret()
 
 	// Connect to database
 	db, err := repository.NewDatabase(dbHost, dbPort, dbName, dbUser, dbPassword)
@@ -67,11 +74,24 @@ func main() {
 		// Start job queue in background
 		go jobQueue.Start()
 		defer jobQueue.Stop()
+
+		// Expose queue depth so a backlog is visible before it becomes an outage.
+		queue := jobQueue
+		metrics.RegisterGauge("job_queue_pending", "Jobs waiting to be claimed.", func() float64 {
+			count, err := queue.PendingCount()
+			if err != nil {
+				return -1
+			}
+			return float64(count)
+		})
+		metrics.RegisterGauge("job_queue_workers", "Configured job queue workers.", func() float64 {
+			return float64(3)
+		})
 	}
 
 	// Create handlers
 	authHandler := handlers.NewAuthHandler(db, jwtSecret)
-	receiptHandler := handlers.NewReceiptHandler(db, jobQueue)
+	receiptHandler := handlers.NewReceiptHandler(jobQueue)
 	invoiceHandler := handlers.NewInvoiceHandler(db)
 	historyHandler := handlers.NewHistoryHandler(db)
 	dashboardHandler := handlers.NewDashboardHandler(db)
@@ -93,6 +113,10 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
 	}).Methods("GET")
+
+	// Prometheus scrape target. monitoring/prometheus.yml points at this path,
+	// which did not exist before, so the backend target was always down.
+	router.Handle("/metrics", metrics.Handler()).Methods("GET")
 
 	// Protected endpoints (authentication required)
 	protectedRouter := router.PathPrefix("").Subrouter()
@@ -117,10 +141,51 @@ func main() {
 
 	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./frontend")))
 
-	// Start server
+	// Start server. Explicit timeouts stop a slow or idle client from holding a
+	// connection open indefinitely; WriteTimeout allows for the synchronous OCR
+	// path, which waits on the engine and then on the company API.
 	port := getEnv("PORT", "8080")
-	log.Printf("Starting server on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, router))
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		log.Printf("Starting server on port %s", port)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrors <- err
+		}
+	}()
+
+	// Shut down on SIGINT/SIGTERM instead of being killed mid-request. log.Fatal
+	// exited the process immediately, so deferred cleanup never ran and in-flight
+	// jobs were left claimed in the database.
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case err := <-serverErrors:
+		log.Printf("Server error: %v", err)
+	case sig := <-shutdown:
+		log.Printf("Received %s, shutting down gracefully...", sig)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Graceful shutdown timed out, closing remaining connections: %v", err)
+			server.Close()
+		}
+	}
+
+	// Deferred jobQueue.Stop() and db.Close() run from here, draining workers
+	// before the process exits.
+	log.Println("Server stopped")
 }
 
 func getEnv(key, defaultValue string) string {
@@ -128,4 +193,59 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// minJWTSecretLength is the shortest signing key accepted. HS256 keys shorter
+// than the 256-bit output are brute-forceable offline from a single token.
+const minJWTSecretLength = 32
+
+// weakJWTSecrets are placeholder values shipped in this repository and its docs.
+// They are public knowledge, so a token signed with one can be forged by anyone.
+var weakJWTSecrets = map[string]bool{
+	"your-secret-key-change-in-production": true,
+	"change-me-in-production":              true,
+	"changeme":                             true,
+	"secret":                               true,
+	"jwt-secret":                           true,
+	"test-secret":                          true,
+}
+
+// resolveJWTSecret loads the JWT signing key, refusing to fall back to a known
+// value. Previously an unset JWT_SECRET silently selected a hardcoded default,
+// which let anyone mint a valid ADMIN token for any deployment.
+func resolveJWTSecret() string {
+	secret := strings.TrimSpace(os.Getenv("JWT_SECRET"))
+	production := handlers.IsProduction()
+
+	if secret == "" {
+		if production {
+			log.Fatal("JWT_SECRET must be set when APP_ENV=production")
+		}
+
+		generated, err := middleware.GenerateRandomSecret()
+		if err != nil {
+			log.Fatalf("Failed to generate a JWT signing key: %v", err)
+		}
+		log.Println("WARNING: JWT_SECRET is not set. Generated a random key for this process;")
+		log.Println("         existing tokens are invalid and all sessions end when it restarts.")
+		return generated
+	}
+
+	if weakJWTSecrets[strings.ToLower(secret)] {
+		if production {
+			log.Fatal("JWT_SECRET is set to a well-known placeholder value; set a unique secret")
+		}
+		log.Println("WARNING: JWT_SECRET is a well-known placeholder value. Anyone can forge tokens.")
+		log.Println("         Set a unique secret before deploying (see backend/.env.example).")
+		return secret
+	}
+
+	if len(secret) < minJWTSecretLength {
+		if production {
+			log.Fatalf("JWT_SECRET must be at least %d characters when APP_ENV=production", minJWTSecretLength)
+		}
+		log.Printf("WARNING: JWT_SECRET is shorter than %d characters and is weak against offline attacks.", minJWTSecretLength)
+	}
+
+	return secret
 }

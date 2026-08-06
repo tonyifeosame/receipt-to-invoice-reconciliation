@@ -97,54 +97,6 @@ async function api(path, options = {}) {
   return data;
 }
 
-async function loadDashboard() {
-  try {
-    const data = await api("/dashboard");
-    document.getElementById("pendingReviews").textContent = data.pending_reviews || 0;
-    document.getElementById("successfulReconciliations").textContent = data.successful_reconciliations || 0;
-    document.getElementById("failedReconciliations").textContent = data.failed_reconciliations || 0;
-    document.getElementById("recentUploads").textContent = data.recent_uploads || 0;
-
-    renderCharts(data);
-
-    const reviews = data.recent_history || [];
-    const reviewList = document.getElementById("reviewList");
-    reviewList.innerHTML = reviews.length
-      ? reviews.map((item) => `
-        <tr>
-          <td>${item.receipt_name || "-"}</td>
-          <td>${item.invoice_number || "-"}</td>
-          <td>72%</td>
-          <td><span class="badge bg-warning text-dark">${item.status || "Pending"}</span></td>
-          <td>
-            <button class="btn btn-sm btn-success me-2" data-action="approve" data-invoice="${item.invoice_number}" data-receipt="${item.receipt_name}">Approve</button>
-            <button class="btn btn-sm btn-outline-danger" data-action="reject" data-invoice="${item.invoice_number}" data-receipt="${item.receipt_name}">Reject</button>
-          </td>
-        </tr>`).join("")
-      : '<tr><td colspan="5" class="text-muted">No review items yet.</td></tr>';
-
-    const auditLogs = document.getElementById("auditLogs");
-    const logs = data.audit_activity || [];
-    auditLogs.innerHTML = logs.length
-      ? logs.map((entry) => `<div class="border rounded p-2 mb-2"><div class="fw-bold">${entry.action}</div><div class="small">${entry.description}</div><div class="small text-muted">${entry.user_name}</div></div>`).join("")
-      : '<div class="text-muted">No audit activity yet.</div>';
-
-    updateTimestamp();
-  } catch (error) {
-    console.error(error);
-  }
-}
-
-async function login(username, password) {
-  const data = await api("/auth/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password })
-  });
-  localStorage.setItem(tokenKey, data.token);
-  initApp();
-}
-
 function formatCurrency(value) {
   return value != null ? `₦${Number(value).toLocaleString()}` : "-";
 }
@@ -240,14 +192,17 @@ function showSearchCard(containerId, title, fields) {
     </div>`;
 }
 
-function setUploadProgress(message, percent) {
-  const statusBox = document.getElementById("uploadStatus");
+function setProgressBar(percent) {
   const progressWrap = document.getElementById("uploadProgressWrap");
   const progressBar = document.getElementById("uploadProgressBar");
   progressWrap.classList.remove("d-none");
   progressBar.style.width = `${percent}%`;
   progressBar.textContent = `${percent}%`;
-  statusBox.innerHTML = `<div class="alert alert-info mb-0">${message}</div>`;
+}
+
+function setUploadProgress(message, percent) {
+  setProgressBar(percent);
+  document.getElementById("uploadStatus").innerHTML = `<div class="alert alert-info mb-0">${message}</div>`;
 }
 
 function showFinalUploadStatus(message, success = true) {
@@ -258,23 +213,65 @@ function showFinalUploadStatus(message, success = true) {
   statusBox.innerHTML = `<div class="alert ${success ? "alert-success" : "alert-danger"}">${message}</div>`;
 }
 
+// The backend answers /ocr/process in one of three shapes:
+//   { job_id, status }                              -> queued for background processing
+//   { ocr_results: {...}, company_response: {...} }  -> OCR ran and was sent to the company API
+//   { receipt_id, ocr: {...}, fields: {...}, ... }   -> OCR ran, no company API configured
+function normalizeOCRResponse(result) {
+  const payload = result.ocr_results || result;
+  return {
+    receiptId: payload.receipt_id || "",
+    requestId: payload.request_id || "",
+    fields: payload.fields || {},
+    meta: payload.ocr || {},
+    rawText: payload.raw_text || "",
+    companyResponse: result.company_response || null
+  };
+}
+
+function renderCompanyResponse(companyResponse) {
+  const statusBox = document.getElementById("uploadStatus");
+  if (!companyResponse) {
+    statusBox.innerHTML = '<div class="alert alert-info mb-0">OCR complete. Results were not sent to the company API.</div>';
+    return;
+  }
+  const variant = companyResponse.success ? "alert-success" : "alert-warning";
+  const message = companyResponse.message || (companyResponse.success ? "Sent to company API" : "Company API did not accept the receipt");
+  statusBox.innerHTML = `<div class="alert ${variant} mb-0">${message}</div>`;
+}
+
 async function processOCR(receiptFile) {
   const result = await api("/ocr/process", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ receipt_file: receiptFile })
   });
-  currentOCRResult = result;
-  document.getElementById("ocrInvoiceNumber").textContent = result.invoice_number || "Not found";
-  document.getElementById("ocrAmount").textContent = result.amount_paid ? formatCurrency(result.amount_paid) : "-";
-  document.getElementById("ocrDate").textContent = result.payment_date || "-";
-  document.getElementById("ocrReference").textContent = result.bank_reference || "-";
-  document.getElementById("ocrCustomer").textContent = result.customer_name || "-";
+
+  // Queued for the background job queue: there are no extracted fields to show yet.
+  if (result.job_id) {
+    currentOCRResult = null;
+    resetOCRPanel();
+    document.getElementById("uploadStatus").innerHTML =
+      `<div class="alert alert-info mb-0">Receipt queued for OCR processing (job ${result.job_id}).</div>`;
+    return;
+  }
+
+  const ocr = normalizeOCRResponse(result);
+  currentOCRResult = ocr;
+
+  const confidence = Number(ocr.meta.confidence || 0);
+  document.getElementById("ocrInvoiceNumber").textContent = ocr.fields.invoice_number || "Not found";
+  document.getElementById("ocrAmount").textContent = ocr.fields.amount ? formatCurrency(ocr.fields.amount) : "-";
+  document.getElementById("ocrDate").textContent = ocr.fields.date || "-";
+  document.getElementById("ocrReference").textContent = ocr.fields.reference || "-";
+  document.getElementById("ocrCustomer").textContent = ocr.fields.customer || "-";
+
   const badge = document.getElementById("ocrConfidenceBadge");
-  badge.textContent = `Confidence ${result.confidence || 0}%`;
-  badge.className = `badge ${result.confidence >= 85 ? "bg-success" : "bg-warning text-dark"} status-pill`;
+  badge.textContent = `Confidence ${confidence}%`;
+  badge.className = `badge ${confidence >= 85 ? "bg-success" : "bg-warning text-dark"} status-pill`;
+
   document.getElementById("ocrPreviewPanel").classList.remove("d-none");
-  document.getElementById("uploadStatus").innerHTML = `<div class="alert alert-info">Invoice ${result.invoice_number ? "Found" : "Not found"}</div>`;
+  renderCompanyResponse(ocr.companyResponse);
 }
 
 async function uploadReceipt(file) {
@@ -305,8 +302,9 @@ async function uploadReceipt(file) {
     previewImage.outerHTML = `<div class="text-muted">Uploaded file: ${file.name}</div>`;
   }
 
+  // processOCR renders its own status message, so only advance the progress bar here.
   await processOCR(receiptPath);
-  setUploadProgress("Invoice found. Ready for review.", 90);
+  setProgressBar(100);
   return uploadResponse;
 }
 
@@ -353,22 +351,26 @@ async function searchPayments(invoiceId) {
 }
 
 async function submitReview(action, invoiceNumber, receiptFile) {
-  await api("/reviews/decision", {
+  // The backend returns { success, message } here: approval and reconciliation are
+  // owned by the company API, so report whatever it says instead of assuming success.
+  const result = await api("/reviews/decision", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ invoice_number: invoiceNumber, receipt_file: receiptFile, decision: action, reason: "Reviewed from dashboard" })
   });
   await loadDashboard();
-  showFinalUploadStatus(action === "approve" ? "Reconciled successfully" : "Review rejected", action === "approve");
+  const fallback = action === "approve" ? "Approval submitted" : "Rejection submitted";
+  showFinalUploadStatus(result.message || fallback, Boolean(result.success));
 }
 
 async function reviewCurrentOCR(decision) {
-  if (!currentOCRResult || !currentOCRResult.invoice_number) {
+  const invoiceNumber = currentOCRResult && currentOCRResult.fields ? currentOCRResult.fields.invoice_number : "";
+  if (!invoiceNumber) {
     showFinalUploadStatus("Cannot review OCR until an invoice is found.", false);
     return;
   }
   const receiptName = currentReceiptFile ? currentReceiptFile.name : "uploaded_receipt";
-  await submitReview(decision, currentOCRResult.invoice_number, receiptName);
+  await submitReview(decision, invoiceNumber, receiptName);
 }
 
 function setupTableControls() {

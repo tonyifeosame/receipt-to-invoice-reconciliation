@@ -3,6 +3,7 @@ bin/
 *.exe
 *.test
 coverage.out
+/backend/main
 
 # C++
 build/
@@ -14,11 +15,16 @@ cmake-build-*/
 *.dll
 
 # Visual Studio Code
+# Personal editor state is ignored; the shared project settings are committed.
 .vscode/
+!.vscode/
+!.vscode/settings.json
 
 # Environment
+# .env holds real credentials; .env.example is the committed template.
 .env
 .env.*
+!.env.example
 
 # Logs
 logs/
@@ -31,7 +37,7 @@ logs/
 # Docker
 docker-data/
 
-# OCR output
+# Uploaded receipts and OCR working files
 receipts/
 uploads/
 temp/

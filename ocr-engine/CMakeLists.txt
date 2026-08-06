@@ -92,6 +92,8 @@ if(BUILD_TESTS)
         src/logger.cpp
     )
 
+    target_include_directories(receipt_parser_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+
     target_link_libraries(
         receipt_parser_test
         GTest::gtest
@@ -99,7 +101,14 @@ if(BUILD_TESTS)
     )
 
     add_test(NAME ReceiptParserTest COMMAND receipt_parser_test)
-endif()
 
-# Register tests
-add_test(NAME ReceiptParserTest COMMAND receipt_parser_test)
+    # Field level accuracy report over the labelled corpus.
+    add_executable(
+        parser_accuracy
+        tests/parser_accuracy.cpp
+        src/receipt_parser.cpp
+        src/logger.cpp
+    )
+
+    target_include_directories(parser_accuracy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+endif()
