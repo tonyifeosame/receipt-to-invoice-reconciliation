@@ -84,13 +84,13 @@
               <div class="col-lg-6">
                 <div class="card shadow-sm p-3 h-100">
                   <h5>Daily reconciliations</h5>
-                  <canvas id="dailyChart" height="180"></canvas>
+                  <div style="position: relative; height: 180px;"><canvas id="dailyChart"></canvas></div>
                 </div>
               </div>
               <div class="col-lg-6">
                 <div class="card shadow-sm p-3 h-100">
                   <h5>OCR success rate</h5>
-                  <canvas id="ocrChart" height="180"></canvas>
+                  <div style="position: relative; height: 180px;"><canvas id="ocrChart"></canvas></div>
                 </div>
               </div>
             </div>
@@ -293,7 +293,7 @@
       </main>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.0.4/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
     <script src="app.js"></script>
   </body>
 </html>
