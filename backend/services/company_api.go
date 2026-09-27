@@ -14,6 +14,7 @@ import (
 	"receipt-reconciliation/metrics"
 	"receipt-reconciliation/models"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -49,6 +50,23 @@ type CompanyAPIResponse struct {
 	Message   string `json:"message"`
 	Data      any    `json:"data,omitempty"`
 	Timestamp string `json:"timestamp"`
+
+	// Reply is the company API's HTTP response exactly as received. The fields
+	// above are a decoding of it, used for logging and the synchronous endpoint;
+	// anything that stores or shows the company's answer must use Reply, which is
+	// never re-encoded and so cannot drop fields, alter numbers or invent values.
+	// Nil when no HTTP response was received (network failure, timeout).
+	Reply *RawReply `json:"-"`
+}
+
+// RawReply is an HTTP response from the company API as received: the most
+// recent one of the call, whatever its status.
+type RawReply struct {
+	StatusCode int
+	Body       []byte
+	// Truncated reports that the body exceeded maxResponseBytes and only its
+	// first maxResponseBytes bytes were kept.
+	Truncated bool
 }
 
 func NewCompanyAPIClient() *CompanyAPIClient {
@@ -121,6 +139,7 @@ func (c *CompanyAPIClient) SendOCRResultsContext(ctx context.Context, ocrData mo
 	log.Printf("Sending OCR results to company API: %s (request_id: %s)", endpoint, ocrData.RequestID)
 
 	var lastError error
+	var lastReply *RawReply
 	attempts := c.maxRetries + 1
 
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -130,8 +149,9 @@ func (c *CompanyAPIClient) SendOCRResultsContext(ctx context.Context, ocrData mo
 				attempt, attempts, ocrData.RequestID, delay)
 			if err := sleepContext(ctx, delay); err != nil {
 				metrics.CompanyAPIResult("cancelled")
-				return c.failureResponse(fmt.Sprintf("Cancelled before attempt %d: %v", attempt, lastError)),
-					fmt.Errorf("company API call cancelled after %d attempt(s): %w", attempt-1, errOr(lastError, err))
+				response := c.failureResponse(fmt.Sprintf("Cancelled before attempt %d: %v", attempt, lastError))
+				response.Reply = lastReply
+				return response, fmt.Errorf("company API call cancelled after %d attempt(s): %w", attempt-1, errOr(lastError, err))
 			}
 		}
 
@@ -142,6 +162,9 @@ func (c *CompanyAPIClient) SendOCRResultsContext(ctx context.Context, ocrData mo
 		}
 
 		lastError = err
+		if response != nil && response.Reply != nil {
+			lastReply = response.Reply
+		}
 
 		if !retryable {
 			// 400/401 and other definitive answers: retrying cannot change them.
@@ -160,7 +183,9 @@ func (c *CompanyAPIClient) SendOCRResultsContext(ctx context.Context, ocrData mo
 
 	metrics.CompanyAPIResult("exhausted")
 	message := fmt.Sprintf("Failed after %d attempt(s): %v", attempts, lastError)
-	return c.failureResponse(message), fmt.Errorf("failed to send OCR results after %d attempt(s): %w", attempts, lastError)
+	response := c.failureResponse(message)
+	response.Reply = lastReply
+	return response, fmt.Errorf("failed to send OCR results after %d attempt(s): %w", attempts, lastError)
 }
 
 // sendOnce performs a single attempt. The second return value reports whether
@@ -191,9 +216,22 @@ func (c *CompanyAPIClient) sendOnce(ctx context.Context, endpoint string, payloa
 		resp.Body.Close()
 	}()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	// One byte past the limit shows whether the body was cut.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, true, fmt.Errorf("failed to read response body: %w", err)
+	}
+	reply := &RawReply{StatusCode: resp.StatusCode, Body: body}
+	if len(body) > maxResponseBytes {
+		reply.Body, reply.Truncated = body[:maxResponseBytes], true
+	}
+	body = reply.Body
+
+	// failure returns a failure response that still carries the reply as received.
+	failure := func(message string) *CompanyAPIResponse {
+		response := c.failureResponse(message)
+		response.Reply = reply
+		return response
 	}
 
 	switch {
@@ -201,30 +239,33 @@ func (c *CompanyAPIClient) sendOnce(ctx context.Context, endpoint string, payloa
 		var apiResponse CompanyAPIResponse
 		if err := json.Unmarshal(body, &apiResponse); err != nil {
 			// A malformed body from a 200 is not going to parse next time.
-			return nil, false, fmt.Errorf("failed to parse company API response: %w", err)
+			return failure("Company API returned a response that is not valid JSON"), false,
+				fmt.Errorf("failed to parse company API response: %w", err)
 		}
+		apiResponse.Reply = reply
 		log.Printf("Company API response: success=%v, message=%s", apiResponse.Success, apiResponse.Message)
 		return &apiResponse, false, nil
 
 	case resp.StatusCode == http.StatusBadRequest:
-		return c.failureResponse(fmt.Sprintf("Validation error: %s", truncateBody(body))), false,
+		return failure(fmt.Sprintf("Validation error: %s", truncateBody(body))), false,
 			fmt.Errorf("company API returned validation error (400): %s", truncateBody(body))
 
 	case resp.StatusCode == http.StatusUnauthorized:
-		return c.failureResponse("Authentication failed - invalid API credentials"), false,
+		return failure("Authentication failed - invalid API credentials"), false,
 			fmt.Errorf("company API returned unauthorized (401): check API credentials")
 
 	case resp.StatusCode == http.StatusTooManyRequests:
 		if wait := retryAfter(resp); wait > 0 {
 			sleepContext(ctx, wait)
 		}
-		return nil, true, fmt.Errorf("company API rate limited the request (429)")
+		return failure("Rate limited (429)"), true, fmt.Errorf("company API rate limited the request (429)")
 
 	case resp.StatusCode >= 500:
-		return nil, true, fmt.Errorf("company API returned server error (%d): %s", resp.StatusCode, truncateBody(body))
+		return failure(fmt.Sprintf("Server error (%d)", resp.StatusCode)), true,
+			fmt.Errorf("company API returned server error (%d): %s", resp.StatusCode, truncateBody(body))
 
 	default:
-		return c.failureResponse(fmt.Sprintf("Unexpected error: %s", truncateBody(body))), false,
+		return failure(fmt.Sprintf("Unexpected error: %s", truncateBody(body))), false,
 			fmt.Errorf("company API returned unexpected status %d: %s", resp.StatusCode, truncateBody(body))
 	}
 }
@@ -314,12 +355,18 @@ func errOr(primary, fallback error) error {
 	return fallback
 }
 
+// truncateBody returns a short, printable excerpt of a reply for error messages.
+// The excerpt ends up in job results and error_message columns, which PostgreSQL
+// rejects if they contain NUL bytes or invalid UTF-8, so those are replaced. The
+// exact reply is kept separately in CompanyAPIResponse.Reply.
 func truncateBody(body []byte) string {
 	const limit = 512
+	suffix := ""
 	if len(body) > limit {
-		return string(body[:limit]) + "... (truncated)"
+		body, suffix = body[:limit], "... (truncated)"
 	}
-	return string(body)
+	excerpt := strings.ToValidUTF8(string(body), "�")
+	return strings.ReplaceAll(excerpt, "\x00", "�") + suffix
 }
 
 func (c *CompanyAPIClient) GetReceiptStatus(receiptFile string) (*CompanyAPIResponse, error) {

@@ -52,13 +52,10 @@ func main() {
 		companyAPI := services.NewCompanyAPIClient()
 		jobQueue = jobs.NewJobQueue(db, 3, ocrService, companyAPI) // 3 worker goroutines
 
-		// Register job handlers (placeholder implementations)
-		jobQueue.RegisterHandler(jobs.JobOCRProcess, func(job *jobs.Job, db *repository.Database, ocrService services.OCRService, companyAPI *services.CompanyAPIClient) error {
-			log.Printf("Processing OCR job %d", job.ID)
-			// TODO: Implement actual OCR processing
-			return nil
-		})
+		// OCR runs the C++ engine and forwards the result to the company API.
+		jobQueue.RegisterHandler(jobs.JobOCRProcess, jobs.ProcessOCRJob)
 
+		// Placeholder implementations.
 		jobQueue.RegisterHandler(jobs.JobReconciliation, func(job *jobs.Job, db *repository.Database, ocrService services.OCRService, companyAPI *services.CompanyAPIClient) error {
 			log.Printf("Processing reconciliation job %d", job.ID)
 			// TODO: Implement actual reconciliation
@@ -95,6 +92,7 @@ func main() {
 	invoiceHandler := handlers.NewInvoiceHandler(db)
 	historyHandler := handlers.NewHistoryHandler(db)
 	dashboardHandler := handlers.NewDashboardHandler(db)
+	jobStatusHandler := handlers.NewJobStatusHandler(db)
 
 	// Get auth middleware
 	authMiddleware := authHandler.GetAuthMiddleware()
@@ -127,6 +125,7 @@ func main() {
 	financeRouter.Use(authMiddleware.RequireRole("FINANCE_STAFF"))
 	financeRouter.HandleFunc("/receipts/upload", receiptHandler.UploadReceipt).Methods("POST")
 	financeRouter.HandleFunc("/ocr/process", receiptHandler.ProcessOCR).Methods("POST")
+	financeRouter.HandleFunc("/jobs/{id}", jobStatusHandler.GetJob).Methods("GET")
 	financeRouter.HandleFunc("/reconcile", receiptHandler.Reconcile).Methods("POST")
 
 	// Invoice endpoints (protected)

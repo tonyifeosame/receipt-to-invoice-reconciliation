@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type Invoice struct {
 	ID            int       `json:"id"`
@@ -86,6 +89,22 @@ type DashboardResponse struct {
 	DailyStats                []DailyReconciliationStats `json:"daily_stats"`
 	RecentPayments            []Payment                  `json:"recent_payments"`
 	RecentHistory             []ReconciliationRecord     `json:"recent_history"`
+}
+
+// JobStatusResponse is a queued job as GET /jobs/{id} reports it. Result is the
+// job's stored outcome exactly as written — for OCR_PROCESS the complete OCR
+// document and the company API's reply — or null before the first attempt.
+type JobStatusResponse struct {
+	JobID        int             `json:"job_id"`
+	Type         string          `json:"type"`
+	Status       string          `json:"status"`
+	Attempts     int             `json:"attempts"`
+	MaxAttempts  int             `json:"max_attempts"`
+	ErrorMessage string          `json:"error_message,omitempty"`
+	CreatedAt    time.Time       `json:"created_at"`
+	StartedAt    *time.Time      `json:"started_at,omitempty"`
+	CompletedAt  *time.Time      `json:"completed_at,omitempty"`
+	Result       json.RawMessage `json:"result"`
 }
 
 type ReconcileResponse struct {

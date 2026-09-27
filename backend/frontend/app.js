@@ -213,12 +213,25 @@ function showFinalUploadStatus(message, success = true) {
   statusBox.innerHTML = `<div class="alert ${success ? "alert-success" : "alert-danger"}">${message}</div>`;
 }
 
-// The backend answers /ocr/process in one of three shapes:
-//   { job_id, status }                              -> queued for background processing
-//   { ocr_results: {...}, company_response: {...} }  -> OCR ran and was sent to the company API
+// OCR text, company API replies and error messages are external data, so they
+// are escaped before being placed in innerHTML.
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]
+  ));
+}
+
+function showUploadAlert(variant, text) {
+  document.getElementById("uploadStatus").innerHTML = `<div class="alert ${variant} mb-0">${escapeHtml(text)}</div>`;
+}
+
+// OCR results arrive in these shapes:
+//   { job_id, status }                              -> /ocr/process queued a job (see pollOCRJob)
+//   { ocr_result: {...}, company_response: {...} }   -> a queued job's stored result (GET /jobs/{id})
+//   { ocr_results: {...}, company_response: {...} }  -> /ocr/process ran synchronously
 //   { receipt_id, ocr: {...}, fields: {...}, ... }   -> OCR ran, no company API configured
 function normalizeOCRResponse(result) {
-  const payload = result.ocr_results || result;
+  const payload = result.ocr_results || result.ocr_result || result;
   return {
     receiptId: payload.receipt_id || "",
     requestId: payload.request_id || "",
@@ -229,34 +242,9 @@ function normalizeOCRResponse(result) {
   };
 }
 
-function renderCompanyResponse(companyResponse) {
-  const statusBox = document.getElementById("uploadStatus");
-  if (!companyResponse) {
-    statusBox.innerHTML = '<div class="alert alert-info mb-0">OCR complete. Results were not sent to the company API.</div>';
-    return;
-  }
-  const variant = companyResponse.success ? "alert-success" : "alert-warning";
-  const message = companyResponse.message || (companyResponse.success ? "Sent to company API" : "Company API did not accept the receipt");
-  statusBox.innerHTML = `<div class="alert ${variant} mb-0">${message}</div>`;
-}
-
-async function processOCR(receiptFile) {
-  const result = await api("/ocr/process", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ receipt_file: receiptFile })
-  });
-
-  // Queued for the background job queue: there are no extracted fields to show yet.
-  if (result.job_id) {
-    currentOCRResult = null;
-    resetOCRPanel();
-    document.getElementById("uploadStatus").innerHTML =
-      `<div class="alert alert-info mb-0">Receipt queued for OCR processing (job ${result.job_id}).</div>`;
-    return;
-  }
-
-  const ocr = normalizeOCRResponse(result);
+// Shows what the OCR engine extracted, exactly as extracted: fields are never
+// hidden or altered because of confidence, which is only displayed.
+function renderOCRResult(ocr) {
   currentOCRResult = ocr;
 
   const confidence = Number(ocr.meta.confidence || 0);
@@ -265,19 +253,193 @@ async function processOCR(receiptFile) {
   document.getElementById("ocrDate").textContent = ocr.fields.date || "-";
   document.getElementById("ocrReference").textContent = ocr.fields.reference || "-";
   document.getElementById("ocrCustomer").textContent = ocr.fields.customer || "-";
+  document.getElementById("ocrRequestId").textContent = ocr.requestId || "-";
+  document.getElementById("ocrRawText").textContent = ocr.rawText || "(no text extracted)";
 
   const badge = document.getElementById("ocrConfidenceBadge");
   badge.textContent = `Confidence ${confidence}%`;
   badge.className = `badge ${confidence >= 85 ? "bg-success" : "bg-warning text-dark"} status-pill`;
 
   document.getElementById("ocrPreviewPanel").classList.remove("d-none");
-  renderCompanyResponse(ocr.companyResponse);
+}
+
+// Shows the company API's reply exactly as received: its HTTP status and body,
+// verbatim. Nothing in it is parsed or interpreted here; any approval or
+// reconciliation decision it carries is the company's. Built with textContent,
+// so the reply can never be interpreted as HTML.
+function renderCompanyReply(reply) {
+  const box = document.getElementById("ocrCompanyResponse");
+  box.replaceChildren();
+  if (!reply) return;
+
+  const label = document.createElement("div");
+  label.className = "small text-muted mb-1";
+  label.textContent = `Company API reply${reply.status ? ` (HTTP ${reply.status})` : ""}${reply.note ? ` — ${reply.note}` : ""}`;
+
+  const body = document.createElement("pre");
+  body.className = "small bg-light p-2 mb-0";
+  body.style.whiteSpace = "pre-wrap";
+  body.textContent = reply.body;
+
+  box.append(label, body);
+}
+
+// The reply stored on a queued job (company_http_status, company_response and,
+// for bodies that are not text, company_response_base64), or null if the
+// company API never answered.
+function storedCompanyReply(result) {
+  if (!result.company_http_status && result.company_response == null && !result.company_response_base64) {
+    return null;
+  }
+  const truncated = result.company_response_truncated ? "truncated to its first 1 MB" : "";
+  if (result.company_response != null) {
+    return { status: result.company_http_status, body: result.company_response, note: truncated };
+  }
+  return {
+    status: result.company_http_status,
+    body: result.company_response_base64,
+    note: ["not text, shown base64-encoded", truncated].filter(Boolean).join("; ")
+  };
+}
+
+// Each upload gets a generation number the moment it starts, before any request
+// is made. Every later step of that upload — the upload request, the OCR request,
+// job polling, completion and errors — checks it before touching the page, so a
+// slower older upload can never overwrite a newer one. Logging out moves it on.
+let uploadGeneration = 0;
+const jobPollIntervalMs = 2000;
+const jobPollTimeoutMs = 5 * 60 * 1000;
+const jobPollMaxErrors = 5;
+
+function startUploadGeneration() {
+  return ++uploadGeneration;
+}
+
+function cancelUploads() {
+  uploadGeneration++;
+}
+
+function isCurrentUpload(generation) {
+  return generation === uploadGeneration;
+}
+
+function describeJob(job) {
+  switch (job.status) {
+    case "PENDING":
+      return job.attempts > 0
+        ? `waiting to retry (attempt ${job.attempts} of ${job.max_attempts} did not finish)`
+        : "queued, waiting for a worker";
+    case "PROCESSING":
+      return `processing (attempt ${job.attempts} of ${job.max_attempts})`;
+    case "COMPLETED":
+      return `completed after ${job.attempts} attempt(s)`;
+    case "FAILED":
+      return `failed after ${job.attempts} attempt(s)`;
+    default:
+      return String(job.status || "unknown").toLowerCase();
+  }
+}
+
+async function pollOCRJob(jobId, generation) {
+  const startedAt = Date.now();
+  let consecutiveErrors = 0;
+
+  showUploadAlert("alert-info", `Receipt queued for OCR processing (job ${jobId}).`);
+
+  while (isCurrentUpload(generation)) {
+    let job = null;
+    try {
+      job = await api(`/jobs/${jobId}`);
+      consecutiveErrors = 0;
+    } catch (error) {
+      consecutiveErrors++;
+      if (consecutiveErrors >= jobPollMaxErrors) {
+        if (isCurrentUpload(generation)) {
+          showUploadAlert("alert-danger", `Could not read the status of job ${jobId}: ${error.message}`);
+        }
+        return;
+      }
+    }
+    if (!isCurrentUpload(generation)) return;
+
+    if (job) {
+      const result = job.result || {};
+      document.getElementById("ocrJobStatus").textContent = `Job ${jobId}: ${describeJob(job)}`;
+      if (result.ocr_result) {
+        renderOCRResult(normalizeOCRResponse(result));
+      }
+      const reply = storedCompanyReply(result);
+      renderCompanyReply(reply);
+
+      if (job.status === "COMPLETED") {
+        setProgressBar(100);
+        showUploadAlert("alert-info", reply
+          ? `Company API replied${reply.status ? ` with HTTP ${reply.status}` : ""}. Its response is shown below.`
+          : "OCR complete.");
+        return;
+      }
+      if (job.status === "FAILED") {
+        setProgressBar(100);
+        const kept = result.ocr_result ? " The OCR result shown was kept." : "";
+        showUploadAlert("alert-danger", `Job ${jobId} failed: ${job.error_message || result.error || "unknown error"}.${kept}`);
+        return;
+      }
+
+      setProgressBar(job.status === "PROCESSING" ? 80 : 65);
+      const lastError = result.error ? ` Last attempt: ${result.error}` : "";
+      showUploadAlert("alert-info", `Job ${jobId}: ${describeJob(job)}.${lastError}`);
+    }
+
+    if (Date.now() - startedAt > jobPollTimeoutMs) {
+      showUploadAlert("alert-warning", `Job ${jobId} is still running. Its result is stored when it finishes.`);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, jobPollIntervalMs));
+  }
+}
+
+async function processOCR(receiptFile, generation) {
+  const result = await api("/ocr/process", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ receipt_file: receiptFile })
+  });
+  if (!isCurrentUpload(generation)) return;
+
+  // Queued for the background job queue: follow the job until it has a result.
+  if (result.job_id) {
+    currentOCRResult = null;
+    resetOCRPanel();
+    await pollOCRJob(result.job_id, generation);
+    return;
+  }
+
+  // Synchronous mode (no database): the backend returns its own decoding of the
+  // company API's reply, not the raw reply, so it is labelled as such.
+  const ocr = normalizeOCRResponse(result);
+  renderOCRResult(ocr);
+  if (ocr.companyResponse) {
+    renderCompanyReply({ body: JSON.stringify(ocr.companyResponse, null, 2), note: "as decoded by the backend (synchronous mode)" });
+    showUploadAlert("alert-info", "OCR complete. The company API's response is shown below.");
+  } else {
+    renderCompanyReply(null);
+    showUploadAlert("alert-info", "OCR complete. Results were not sent to the company API.");
+  }
 }
 
 async function uploadReceipt(file) {
-  const statusBox = document.getElementById("uploadStatus");
-  const progressWrap = document.getElementById("uploadProgressWrap");
-  const progressBar = document.getElementById("uploadProgressBar");
+  // Taken before anything asynchronous happens, so every step below belongs to this upload.
+  const generation = startUploadGeneration();
+  try {
+    await runUpload(file, generation);
+  } catch (error) {
+    if (isCurrentUpload(generation)) {
+      showFinalUploadStatus(error.message, false);
+    }
+  }
+}
+
+async function runUpload(file, generation) {
   const previewImage = document.getElementById("receiptPreviewImage");
   const ocrPanel = document.getElementById("ocrPreviewPanel");
 
@@ -293,19 +455,20 @@ async function uploadReceipt(file) {
     method: "POST",
     body: formData
   });
+  if (!isCurrentUpload(generation)) return;
 
   setUploadProgress("OCR Processing...", 55);
   const receiptPath = uploadResponse.file_path || uploadResponse.file || file.name;
   if (file.type.startsWith("image/")) {
     previewImage.src = URL.createObjectURL(file);
   } else {
-    previewImage.outerHTML = `<div class="text-muted">Uploaded file: ${file.name}</div>`;
+    previewImage.outerHTML = `<div class="text-muted">Uploaded file: ${escapeHtml(file.name)}</div>`;
   }
 
   // processOCR renders its own status message, so only advance the progress bar here.
-  await processOCR(receiptPath);
+  await processOCR(receiptPath, generation);
+  if (!isCurrentUpload(generation)) return;
   setProgressBar(100);
-  return uploadResponse;
 }
 
 function formatInvoiceResult(data) {
@@ -514,6 +677,10 @@ function resetOCRPanel() {
   document.getElementById("ocrDate").textContent = "-";
   document.getElementById("ocrReference").textContent = "-";
   document.getElementById("ocrCustomer").textContent = "-";
+  document.getElementById("ocrRequestId").textContent = "-";
+  document.getElementById("ocrRawText").textContent = "";
+  document.getElementById("ocrJobStatus").textContent = "";
+  document.getElementById("ocrCompanyResponse").innerHTML = "";
   document.getElementById("ocrConfidenceBadge").textContent = "Confidence";
 }
 
@@ -529,6 +696,7 @@ document.getElementById("loginForm").addEventListener("submit", async (event) =>
 });
 
 document.getElementById("logoutBtn").addEventListener("click", () => {
+  cancelUploads();
   localStorage.removeItem(tokenKey);
   setAuthState(false);
 });

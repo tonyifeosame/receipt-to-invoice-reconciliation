@@ -1,0 +1,24 @@
+# Build context for backend/Dockerfile, which is built from the repository root
+# because it needs backend/ and ocr-engine/. Everything else stays out of the
+# image: in particular uploaded receipts, local build output and secrets.
+.git
+.gitignore
+.vscode
+**/.env
+**/*.log
+
+receipts/
+*.jpg
+*.jpeg
+*.png
+*.pdf
+
+**/build/
+**/cmake-build-*/
+
+ci/
+database/
+docs/
+monitoring/
+README.md
+docker-compose.yml

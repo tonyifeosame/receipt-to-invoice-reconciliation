@@ -231,3 +231,88 @@ func TestSendOCRResults_LimitsResponseSize(t *testing.T) {
 		t.Fatalf("failure message was not truncated: %d bytes", len(resp.Message))
 	}
 }
+
+// The reply must be kept exactly as received: a decoding into
+// CompanyAPIResponse drops unknown fields and rounds large numbers.
+func TestSendOCRResults_KeepsTheReplyExactlyAsReceived(t *testing.T) {
+	const body = `{ "decision":"APPROVED",  "reference_id":"CMP-77", "big_id":12345678901234567890, "amount":123625.10 }`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, body)
+	}))
+	defer server.Close()
+
+	resp, err := testClient(t, server.URL).SendOCRResults(sampleOCR())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Reply == nil || resp.Reply.StatusCode != http.StatusOK || string(resp.Reply.Body) != body || resp.Reply.Truncated {
+		t.Fatalf("expected the reply verbatim, got %+v", resp.Reply)
+	}
+}
+
+func TestSendOCRResults_KeepsNon2xxRepliesAndTheirStatus(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"validation", http.StatusBadRequest, `{"error":"invalid invoice","field":"amount"}`},
+		{"unauthorized", http.StatusUnauthorized, `{"error":"bad key"}`},
+		{"unexpected", http.StatusConflict, "duplicate request"},
+		{"server error after retries", http.StatusServiceUnavailable, "<html>maintenance</html>"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, tc.body)
+			}))
+			defer server.Close()
+
+			resp, err := testClient(t, server.URL).SendOCRResults(sampleOCR())
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if resp == nil || resp.Reply == nil || resp.Reply.StatusCode != tc.status || string(resp.Reply.Body) != tc.body {
+				t.Fatalf("expected status %d and body %q kept, got %+v", tc.status, tc.body, resp)
+			}
+		})
+	}
+}
+
+func TestSendOCRResults_NoReplyWhenNothingWasReceived(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := server.URL
+	server.Close() // connection refused
+
+	resp, err := testClient(t, url).SendOCRResults(sampleOCR())
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if resp == nil || resp.Reply != nil {
+		t.Fatalf("expected a failure response without a reply, got %+v", resp)
+	}
+}
+
+func TestSendOCRResults_MarksAnOversizedReplyAsTruncated(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, strings.Repeat("A", maxResponseBytes+10))
+	}))
+	defer server.Close()
+
+	resp, _ := testClient(t, server.URL).SendOCRResults(sampleOCR())
+	if resp.Reply == nil || !resp.Reply.Truncated || len(resp.Reply.Body) != maxResponseBytes {
+		t.Fatalf("expected a truncated reply of %d bytes, got truncated=%v len=%d", maxResponseBytes, resp.Reply != nil && resp.Reply.Truncated, len(resp.Reply.Body))
+	}
+}
+
+// The decoded fields are for logging and the synchronous endpoint only; the
+// reply must not leak into that endpoint's JSON.
+func TestCompanyAPIResponse_ReplyIsNotPartOfItsJSON(t *testing.T) {
+	data, _ := json.Marshal(CompanyAPIResponse{Success: true, Reply: &RawReply{StatusCode: 200, Body: []byte("x")}})
+	if strings.Contains(string(data), "Reply") || strings.Contains(string(data), "StatusCode") {
+		t.Fatalf("Reply must not be serialised, got %s", data)
+	}
+}

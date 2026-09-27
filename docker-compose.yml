@@ -26,7 +26,8 @@ services:
       # added here as well, or it will not run on a fresh database.
       - ./database/migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
       - ./database/migrations/002_production_features.sql:/docker-entrypoint-initdb.d/002_production_features.sql:ro
-      - ./database/seed.sql:/docker-entrypoint-initdb.d/003_seed.sql:ro
+      - ./database/migrations/003_job_results.sql:/docker-entrypoint-initdb.d/003_job_results.sql:ro
+      - ./database/seed.sql:/docker-entrypoint-initdb.d/004_seed.sql:ro
     networks:
       - receipt-network
     healthcheck:
@@ -37,8 +38,10 @@ services:
 
   backend:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      # Repository root: the backend image also compiles ocr-engine/, which it
+      # runs to OCR receipts (see backend/Dockerfile).
+      context: .
+      dockerfile: backend/Dockerfile
     container_name: receipt-backend
     restart: unless-stopped
     environment:

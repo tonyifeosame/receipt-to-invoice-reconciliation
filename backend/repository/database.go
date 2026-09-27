@@ -176,6 +176,40 @@ func (d *Database) GetRecentPayments() ([]models.Payment, error) {
 	return payments, nil
 }
 
+// GetJob returns one queued job with its stored result, or nil if there is no
+// job with that id. The result column is returned as stored, never rewritten.
+func (d *Database) GetJob(id int) (*models.JobStatusResponse, error) {
+	var job models.JobStatusResponse
+	var errorMessage sql.NullString
+	var startedAt, completedAt sql.NullTime
+	var result []byte
+
+	err := d.db.QueryRow(`SELECT id, job_type, status, attempts, max_attempts, error_message,
+	                             created_at, started_at, completed_at, result
+	                      FROM job_queue WHERE id = $1`, id).Scan(
+		&job.JobID, &job.Type, &job.Status, &job.Attempts, &job.MaxAttempts, &errorMessage,
+		&job.CreatedAt, &startedAt, &completedAt, &result,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	job.ErrorMessage = errorMessage.String
+	if startedAt.Valid {
+		job.StartedAt = &startedAt.Time
+	}
+	if completedAt.Valid {
+		job.CompletedAt = &completedAt.Time
+	}
+	if result != nil {
+		job.Result = result
+	}
+	return &job, nil
+}
+
 // Helper methods for direct SQL access (used by job queue)
 func (d *Database) QueryRow(query string, args ...interface{}) *sql.Row {
 	return d.db.QueryRow(query, args...)
